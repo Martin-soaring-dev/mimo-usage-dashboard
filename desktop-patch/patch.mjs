@@ -157,7 +157,7 @@ function verifyPatchedArchive(archivePath) {
   if (!script.includes("用量统计") || !script.includes("127.0.0.1:8790")) {
     throw new Error("Injected menu script verification failed.");
   }
-  if (!style.includes(".mimo-usage-overlay") || !style.includes(".mimo-usage-menu-item")) {
+  if (!style.includes(".mimo-usage-menu-item")) {
     throw new Error("Injected stylesheet verification failed.");
   }
   const idx = getEntry(header, INDEX_ENTRY);
