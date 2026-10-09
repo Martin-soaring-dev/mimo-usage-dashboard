@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "mimo-usage-dashboard",
+  "version": "0.1.2",
+  "description": "Local usage dashboard & plugin for MiMo Desktop — token usage, cache hit rate, model share, and a 12-month heatmap, all read locally.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Martin-soaring-dev",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "server.mjs",
+    "usage-core.mjs",
+    "dashboard.html",
+    "plugin",
+    "skill",
+    "install.ps1",
+    "register-plugin.mjs",
+    "start-dashboard.cmd",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mimo",
+    "mimo-desktop",
+    "mimocode",
+    "xiaomi",
+    "opencode",
+    "plugin",
+    "usage",
+    "dashboard",
+    "tokens",
+    "cache",
+    "heatmap"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Martin-soaring-dev/mimo-usage-dashboard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Martin-soaring-dev/mimo-usage-dashboard/issues"
+  },
+  "homepage": "https://github.com/Martin-soaring-dev/mimo-usage-dashboard#readme",
+  "scripts": {
+    "check": "node --check index.mjs && node --check plugin/usage-dashboard.mjs && node --check server.mjs && node --check usage-core.mjs && node --check test/smoke.mjs",
+    "smoke": "node test/smoke.mjs",
+    "test": "npm run check && npm run smoke",
+    "server": "node server.mjs --open"
+  },
+  "dependencies": {
+    "@mimo-ai/plugin": "^0.1.15"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
