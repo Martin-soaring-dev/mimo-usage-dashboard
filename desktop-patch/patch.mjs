@@ -12,10 +12,12 @@ import { execFileSync } from "node:child_process";
 import { extractFile, getRawHeader } from "@electron/asar";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const INJECT_FILE = path.join(HERE, "renderer-menu-patch.js");
+const SCRIPT_FILE = path.join(HERE, "renderer-menu-patch.js");
+const STYLE_FILE = path.join(HERE, "renderer-menu-patch.css");
 const DEFAULT_ASAR = "D:\\Program Files\\Xiaomi MiMo\\resources\\app.asar";
 const INDEX_ENTRY = "out\\renderer\\index.html";
 const SCRIPT_ENTRY = "out\\renderer\\usage-dashboard-menu-patch.js";
+const STYLE_ENTRY = "out\\renderer\\usage-dashboard-menu-patch.css";
 const PATCH_MARKER = "<!-- MIMO_USAGE_MENU_PATCH -->";
 const INTEGRITY_BLOCK_SIZE = 4 * 1024 * 1024;
 
@@ -109,7 +111,7 @@ function patchHtml(html) {
   if (!html.includes("</body>")) throw new Error("Renderer entry has no </body> insertion point; refusing to patch.");
   return html.replace(
     "</body>",
-    `  <script src="./usage-dashboard-menu-patch.js"></script>\n  ${PATCH_MARKER}\n</body>`,
+    `  <link rel="stylesheet" href="./usage-dashboard-menu-patch.css" />\n  <script src="./usage-dashboard-menu-patch.js"></script>\n  ${PATCH_MARKER}\n</body>`,
   );
 }
 
@@ -122,36 +124,46 @@ function buildPatchedArchive(asar) {
   const originalHtml = extractFile(asar, INDEX_ENTRY).toString("utf8");
   if (originalHtml.includes(PATCH_MARKER)) throw new Error("The usage menu patch is already present.");
   const patchedHtml = Buffer.from(patchHtml(originalHtml), "utf8");
-  const patchScript = fs.readFileSync(INJECT_FILE);
+  const patchScript = fs.readFileSync(SCRIPT_FILE);
+  const patchStyle = fs.readFileSync(STYLE_FILE);
 
   const indexEntry = getEntry(header, INDEX_ENTRY);
   const scriptEntry = getEntry(header, SCRIPT_ENTRY, { create: true });
+  const styleEntry = getEntry(header, STYLE_ENTRY, { create: true });
   const scriptOffset = oldData.length;
-  const htmlOffset = scriptOffset + patchScript.length;
+  const styleOffset = scriptOffset + patchScript.length;
+  const htmlOffset = styleOffset + patchStyle.length;
   Object.assign(scriptEntry, { size: patchScript.length, offset: String(scriptOffset), executable: false });
+  Object.assign(styleEntry, { size: patchStyle.length, offset: String(styleOffset), executable: false });
   Object.assign(indexEntry, { size: patchedHtml.length, offset: String(htmlOffset) });
   addIntegrity(scriptEntry, patchScript);
+  addIntegrity(styleEntry, patchStyle);
   addIntegrity(indexEntry, patchedHtml);
 
   const headerPickle = pickleString(JSON.stringify(header));
   const sizePickle = pickleUInt32(headerPickle.length);
-  const archive = Buffer.concat([sizePickle, headerPickle, oldData, patchScript, patchedHtml]);
-  return { archive, header, scriptOffset, htmlOffset, oldDataBytes: oldData.length };
+  const archive = Buffer.concat([sizePickle, headerPickle, oldData, patchScript, patchStyle, patchedHtml]);
+  return { archive, header, oldDataBytes: oldData.length };
 }
 
 function verifyPatchedArchive(archivePath) {
   const { header } = getRawHeader(archivePath);
   const html = extractFile(archivePath, INDEX_ENTRY).toString("utf8");
   const script = extractFile(archivePath, SCRIPT_ENTRY).toString("utf8");
-  if (!html.includes(PATCH_MARKER) || !html.includes("usage-dashboard-menu-patch.js")) {
+  const style = extractFile(archivePath, STYLE_ENTRY).toString("utf8");
+  if (!html.includes(PATCH_MARKER) || !html.includes("usage-dashboard-menu-patch.js") || !html.includes("usage-dashboard-menu-patch.css")) {
     throw new Error("Patched renderer HTML verification failed.");
   }
   if (!script.includes("用量统计") || !script.includes("127.0.0.1:8790")) {
     throw new Error("Injected menu script verification failed.");
   }
+  if (!style.includes(".mimo-usage-overlay") || !style.includes(".mimo-usage-menu-item")) {
+    throw new Error("Injected stylesheet verification failed.");
+  }
   const idx = getEntry(header, INDEX_ENTRY);
   const js = getEntry(header, SCRIPT_ENTRY);
-  if (!idx.integrity || !js.integrity) throw new Error("ASAR integrity metadata is missing.");
+  const css = getEntry(header, STYLE_ENTRY);
+  if (!idx.integrity || !js.integrity || !css.integrity) throw new Error("ASAR integrity metadata is missing.");
 }
 
 function verifyPreservedEntries(originalAsar, patchedAsar) {
@@ -179,15 +191,17 @@ function inspect(asar) {
 async function dryRun(asar) {
   requireWindows();
   if (!fs.existsSync(asar)) throw new Error(`MiMo app.asar not found: ${asar}`);
+  // Validate against the pristine archive when a backup exists (asar itself may be patched).
+  const source = fs.existsSync(`${asar}.mimo-usage-backup`) ? `${asar}.mimo-usage-backup` : asar;
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "mimo-usage-asar-dryrun-"));
   const staged = path.join(temp, "app.asar");
   try {
-    const built = buildPatchedArchive(asar);
+    const built = buildPatchedArchive(source);
     fs.writeFileSync(staged, built.archive);
     verifyPatchedArchive(staged);
-    verifyPreservedEntries(asar, staged);
+    verifyPreservedEntries(source, staged);
     console.log("Dry-run passed; original data and app.asar.unpacked are preserved byte-for-byte.");
-    console.log(`Original data: ${(built.oldDataBytes / (1024 * 1024)).toFixed(1)} MiB; appended renderer files: ${built.archive.length - fs.statSync(asar).size + (8 + getRawHeader(asar).headerSize - (8 + getRawHeader(staged).headerSize))} bytes.`);
+    console.log(`Original archive: ${(fs.statSync(asar).size / (1024 * 1024)).toFixed(1)} MiB; patched archive: ${(built.archive.length / (1024 * 1024)).toFixed(1)} MiB.`);
     console.log("No installed app files or backups were changed.");
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
@@ -200,17 +214,20 @@ async function apply(asar) {
   assertAppClosed();
   verifyWritable(asar);
   const backup = `${asar}.mimo-usage-backup`;
-  if (fs.existsSync(backup)) throw new Error(`Backup already exists: ${backup}\nRestore it first or move it aside before applying again.`);
+  // Always patch from the pristine backup so the operation is repeatable.
+  if (!fs.existsSync(backup)) fs.copyFileSync(asar, backup, fs.constants.COPYFILE_EXCL);
+  const pristine = backup;
+  const alreadyPatched = extractFile(pristine, INDEX_ENTRY).toString("utf8").includes(PATCH_MARKER);
+  if (alreadyPatched) throw new Error(`Backup is not a pristine copy (already patched): ${backup}`);
 
   const temp = fs.mkdtempSync(path.join(path.dirname(asar), "mimo-usage-patch-"));
   const staged = path.join(temp, "app.asar");
   const displaced = `${asar}.mimo-usage-displaced`;
   try {
-    const built = buildPatchedArchive(asar);
+    const built = buildPatchedArchive(pristine);
     fs.writeFileSync(staged, built.archive);
     verifyPatchedArchive(staged);
-    verifyPreservedEntries(asar, staged);
-    fs.copyFileSync(asar, backup, fs.constants.COPYFILE_EXCL);
+    verifyPreservedEntries(pristine, staged);
     fs.renameSync(asar, displaced);
     try {
       fs.renameSync(staged, asar);
