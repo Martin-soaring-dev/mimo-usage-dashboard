@@ -5,7 +5,7 @@ import plugin from "../index.mjs";
 
 assert.equal(typeof plugin, "function", "index.mjs 应默认导出一个插件函数");
 
-const hooks = await plugin({}, {});
+const hooks = await plugin({}, { autoStart: false });
 assert.ok(hooks && typeof hooks === "object", "插件应返回 hooks 对象");
 assert.ok(hooks.tool && typeof hooks.tool === "object", "hooks.tool 应为对象");
 

@@ -101,8 +101,11 @@ function openBrowser(url) {
   } catch { /* noop */ }
 }
 
-export default async () => {
+export default async (_input, options = {}) => {
   const cfg = readConfig();
+  // The optional native Desktop menu patch opens the dashboard in an iframe.
+  // Keep the loopback service ready while the MiMo engine is running.
+  if (options.autoStart !== false) void ensureServer(cfg).catch(() => {});
   return {
     tool: {
       usage_stats: tool({

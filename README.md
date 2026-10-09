@@ -88,6 +88,38 @@ node server.mjs --open   # 需要 Node.js >= 22（用了内置 node:sqlite）
 
 直接打开仪表盘：`http://127.0.0.1:8790`。
 
+### 实验性：在桌面头像菜单增加「用量统计」
+
+MiMo Desktop 没有公开的 React/侧边栏 UI 插件接口。仓库提供一个**可选的 app.asar 补丁**，在头像菜单的「剩余用量」下面插入「用量统计」，点击后以弹窗 iframe 打开完整仪表盘。补丁会先备份原始 app.asar 和 app.asar.unpacked，支持还原；它**不是官方支持的插件扩展点**。
+
+1. 克隆此仓库，在仓库目录安装开发依赖并检查：
+
+   ```powershell
+   npm install
+   # 只读检查安装位置
+   npm run desktop:inspect
+   # 在临时目录抽取、注入并重打包验证；不改已安装 App
+   npm run desktop:dry-run
+   ```
+
+2. 运行 `install.ps1` 安装仓库中的最新插件文件（插件初始化时会启动本机服务），然后完全退出 MiMo Desktop，包括托盘进程：
+
+   ```powershell
+   .\install.ps1
+   ```
+
+3. 在**管理员 PowerShell**中进入仓库目录并运行：
+
+   ```powershell
+   npm run desktop:patch
+   ```
+
+4. 重开 MiMo Desktop，打开左下角头像菜单，点「用量统计」。
+
+还原原版：完全退出 MiMo Desktop，在管理员 PowerShell 中运行 `npm run desktop:restore`。
+
+> **风险与限制**：应用升级可能覆盖补丁；升级后需重新运行补丁。此补丁会重打包官方 app.asar，只建议个人本机使用。若启动异常，退出应用后运行还原命令。不要把改过的 app.asar 分发给他人。
+
 ## 工作原理
 
 ```
@@ -136,6 +168,7 @@ npm install
 npm test          # 语法检查 + 冒烟测试
 npm run server    # 本地起仪表盘
 npm pack --dry-run
+npm run desktop:inspect # 查看本机 MiMo asar 信息；只读
 ```
 
 ## 发布（维护者）

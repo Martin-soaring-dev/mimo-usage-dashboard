@@ -91,6 +91,38 @@ Inside MiMo Desktop:
 
 Open the dashboard directly at `http://127.0.0.1:8790`.
 
+### Experimental: add “Usage” to the Desktop account menu
+
+MiMo Desktop has no public React/sidebar UI plugin API. This repository includes an **optional app.asar patch** that adds a “用量统计” item below “剩余用量” in the account menu and opens the full dashboard in a modal iframe. It backs up the original `app.asar` and `app.asar.unpacked` and includes a restore command. This is **not an officially supported extension point**.
+
+1. Clone this repository and run:
+
+   ```powershell
+   npm install
+   # Read-only installation inspection
+   npm run desktop:inspect
+   # Extract, inject, and repack in a temp directory only; does not alter the installed app
+   npm run desktop:dry-run
+   ```
+
+2. Run `install.ps1` to install the latest plugin file from this checkout (the plugin starts the local service on initialization), then fully quit MiMo Desktop, including its tray process:
+
+   ```powershell
+   .\install.ps1
+   ```
+
+3. In an **Administrator PowerShell** window, switch to the repository and run:
+
+   ```powershell
+   npm run desktop:patch
+   ```
+
+4. Restart MiMo Desktop, open the account menu at the lower left, and choose “用量统计”.
+
+To restore the original app, fully quit MiMo Desktop and run `npm run desktop:restore` in an Administrator PowerShell window.
+
+> **Risks and limitations**: App updates can overwrite this patch; rerun the patch after updating. It repacks the official app.asar and is intended for personal use only. If startup fails, quit the app and restore the backup. Do not distribute a modified app.asar.
+
 ## How it works
 
 ```
@@ -140,6 +172,8 @@ npm install
 npm test          # syntax check + smoke test
 npm run server    # run the dashboard locally
 npm pack --dry-run
+npm run desktop:inspect # read-only inspection of the local MiMo asar
+npm run desktop:dry-run # patch/repack validation in a temporary directory
 ```
 
 ## Publishing (maintainers)

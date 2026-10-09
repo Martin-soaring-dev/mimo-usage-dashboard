@@ -45,10 +45,14 @@
   },
   "homepage": "https://github.com/Martin-soaring-dev/mimo-usage-dashboard#readme",
   "scripts": {
-    "check": "node --check index.mjs && node --check plugin/usage-dashboard.mjs && node --check server.mjs && node --check usage-core.mjs && node --check test/smoke.mjs",
+    "check": "node --check index.mjs && node --check plugin/usage-dashboard.mjs && node --check server.mjs && node --check usage-core.mjs && node --check test/smoke.mjs && node --check desktop-patch/renderer-menu-patch.js && node --check desktop-patch/patch.mjs",
     "smoke": "node test/smoke.mjs",
     "test": "npm run check && npm run smoke",
-    "server": "node server.mjs --open"
+    "server": "node server.mjs --open",
+    "desktop:inspect": "node desktop-patch/patch.mjs inspect",
+    "desktop:dry-run": "node desktop-patch/patch.mjs dry-run",
+    "desktop:patch": "node desktop-patch/patch.mjs apply",
+    "desktop:restore": "node desktop-patch/patch.mjs restore"
   },
   "dependencies": {
     "@mimo-ai/plugin": "^0.1.15"
@@ -56,5 +60,8 @@
   "publishConfig": {
     "access": "public",
     "provenance": true
+  },
+  "devDependencies": {
+    "@electron/asar": "^4.3.1"
   }
 }
