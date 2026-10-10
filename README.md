@@ -120,6 +120,14 @@ MiMo Desktop 没有公开的 React/侧边栏 UI 插件接口。仓库提供一�
 
 > **风险与限制**：应用升级可能覆盖补丁；升级后需重新运行补丁。此补丁会重打包官方 app.asar，只建议个人本机使用。若启动异常，退出应用后运行还原命令。不要把改过的 app.asar 分发给他人。
 
+## 扩展面（想加"入口/按钮"必读）
+
+MiMo 的**引擎**开源（[XiaomiMiMo/MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code)，MIT），但**桌面应用闭源**。
+右侧面板的 "+" 菜单、侧边栏 tab 都是编译进 bundle 的常量，**只能靠 app.asar 补丁**；插件体系能加的"入口"是
+composer 的 `/` 菜单（Command / Skill / MCP）和对话内的 `sci-widget`、产物 / 内置浏览器。
+
+详细接口清单、代码证据与三条可选路线见 [`docs/extensibility.md`](./docs/extensibility.md)。
+
 ## 工作原理
 
 ```
@@ -156,6 +164,8 @@ usage-core.mjs              数据层：读库并聚合
 server.mjs                  本地 HTTP 服务（仅 127.0.0.1）
 dashboard.html              仪表盘页面（自带 SVG 图表，无外部依赖）
 skill/                      技能（Plugins 页显示）
+docs/extensibility.md       扩展面调研（插件/MCP/命令/sci-widget/产物 等接口清单）
+desktop-patch/              实验性 app.asar 补丁（右侧/头像菜单注入 + 还原）
 install.ps1 / register-plugin.mjs / start-dashboard.cmd
 test/smoke.mjs              冒烟测试
 .github/workflows/          CI 与发布

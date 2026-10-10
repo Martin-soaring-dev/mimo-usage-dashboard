@@ -123,6 +123,12 @@ To restore the original app, fully quit MiMo Desktop and run `npm run desktop:re
 
 > **Risks and limitations**: App updates can overwrite this patch; rerun the patch after updating. It repacks the official app.asar and is intended for personal use only. If startup fails, quit the app and restore the backup. Do not distribute a modified app.asar.
 
+## Extensibility (read this before adding an "entry" / button)
+
+The MiMo **engine** is open source ([XiaomiMiMo/MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code), MIT), but the **desktop app is closed source**. The right-panel "+" menu and sidebar tabs are constants compiled into the bundle — only an app.asar patch can change them. What the plugin ecosystem *can* add: entries in the composer `/` menu (Command / Skill / MCP), inline `sci-widget` blocks in the chat, and artifacts / the built-in browser.
+
+Full interface inventory, code evidence, and three possible routes: [`docs/extensibility.md`](./docs/extensibility.md) (Chinese).
+
 ## How it works
 
 ```
@@ -163,6 +169,8 @@ install.ps1 / register-plugin.mjs / start-dashboard.cmd
 test/smoke.mjs              smoke test
 .github/workflows/          CI and release
 docs/preview.svg            preview image
+docs/extensibility.md       extension-surface survey (plugin / MCP / command / sci-widget / artifacts)
+desktop-patch/              experimental app.asar patch (menu injection + restore)
 ```
 
 ## Development

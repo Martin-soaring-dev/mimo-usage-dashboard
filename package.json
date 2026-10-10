@@ -15,6 +15,7 @@
     "server.mjs",
     "usage-core.mjs",
     "dashboard.html",
+    "docs",
     "plugin",
     "skill",
     "install.ps1",
