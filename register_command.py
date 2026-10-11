@@ -102,11 +102,11 @@ def build_usage_template(py: str, script: str) -> str:
     cmd = f"{q(py)} {q(script)}"
     return (
         "用户请求查看 MiMo Desktop 本机用量。下面一行是本地脚本的真实输出"
-        "（已生成好静态 HTML 页面，脚本零 AI 参与、纯离线）：\\n\\n"
-        f"!`{cmd}`\\n\\n"
+        "（已生成好静态 HTML 页面，脚本零 AI 参与、纯离线）：\n\n"
+        f"!`{cmd}`\n\n"
         "请把上面这一行输出**原样**告诉用户，并提醒他打开该 HTML 文件即可看到"
         "完整的用量看板（Token 用量 / Session 用量 / 上下文占用）。"
-        "如需筛选某一类数据或指定日期，请直接运行本地 CLI。\\n"
+        "如需筛选某一类数据或指定日期，请直接运行本地 CLI。\n"
         "不要臆造或改写任何数字，不要自己渲染图表，也不要额外调用其它工具。"
     )
 
@@ -116,8 +116,8 @@ def build_open_template(py: str, script: str) -> str:
     cmd = f"{q(py)} {q(script)} --open"
     return (
         "用户请求打开 MiMo Desktop 用量看板。下面一行是本地脚本的真实输出"
-        "（脚本已生成静态 HTML 并用默认浏览器打开）：\\n\\n"
-        f"!`{cmd}`\\n\\n"
+        "（脚本已生成静态 HTML 并用默认浏览器打开）：\n\n"
+        f"!`{cmd}`\n\n"
         "请把这一行原样告诉用户即可，不要臆造数字，不要调用其它工具。"
     )
 

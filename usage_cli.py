@@ -1038,7 +1038,7 @@ def _sanitize_args(argv: list[str]) -> list[str]:
     """
     out: list[str] = []
     i = 0
-    shell_chars = ";|&$" + chr(96) + "><\\n\\r\\\\"
+    shell_chars = ";|&$" + chr(96) + "><" + chr(10) + chr(13) + chr(92)
     while i < len(argv):
         tok = argv[i]
         stripped = tok.strip().strip(chr(34)).strip(chr(39))

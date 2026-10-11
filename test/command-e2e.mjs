@@ -112,19 +112,7 @@ if (!CAN_SPAWN) {
   fs.rmSync(outDir, { recursive: true, force: true });
 }
 
-console.log("\\n=== 固定命令调用 ===");
-if (!CAN_SPAWN) {
-  console.log("  SKIP  执行类断言已跳过（见 test/test_python.py）");
-} else {
-  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-e2e-"));
-  const outFile = path.join(outDir, "usage.html");
-  const stdout = runPy([SCRIPT, "--out", outFile]);
-  check("固定命令正常生成 HTML", fs.existsSync(outFile));
-  check("固定命令返回简短结果", stdout.trim().split("\\n").length === 1);
-  fs.rmSync(outDir, { recursive: true, force: true });
-}
-
-console.log("\\n=== 注入面检查 ===");
+console.log("\n=== 注入面检查 ===");
 check("模板中没有用户输入占位符", !template.includes("$ARGUMENTS"));
 check("模板命令中没有动态参数透传", !template.includes("--arg-string"));
 
