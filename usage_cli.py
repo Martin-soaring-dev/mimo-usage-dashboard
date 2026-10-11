@@ -1047,7 +1047,9 @@ def _sanitize_args(argv: list[str]) -> list[str]:
             continue
         if stripped in _SAFE_FLAGS:
             out.append(stripped)
-        elif stripped in _SAFE_OPTS and i + 1 < len(argv):
+        elif stripped in _SAFE_OPTS:
+            if i + 1 >= len(argv):
+                raise ValueError(f"{stripped} 缺少参数")
             val = argv[i + 1].strip().strip(chr(34)).strip(chr(39))
             if stripped in ("--out", "--db"):
                 if not val or any(ch in val for ch in shell_chars.replace(chr(92), "")):
