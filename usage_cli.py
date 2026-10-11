@@ -1031,33 +1031,32 @@ def _split_args(text: str) -> list[str]:
 
 
 def _sanitize_args(argv: list[str]) -> list[str]:
-    """白名单校验：只允许已知的 kind 与已知选项，其余一律丢弃。
+    """Allow-list CLI args. Filesystem paths may contain Windows backslashes.
 
-    这是针对 `command` 模板里 `` !`… $ARGUMENTS` `` 的直接防护 ——
-    用户输入会先被拼进 shell 命令行，任何多余的 token（如 `;`、`&&`、反引号）
-    都必须在进入 shell 之前被剔除。
+    This is not a shell-escaping function. Registered MiMo templates must not interpolate
+    untrusted arguments into shell text; they now execute a fixed command only.
     """
     out: list[str] = []
     i = 0
+    shell_chars = ";|&$" + chr(96) + "><\\n\\r\\\\"
     while i < len(argv):
         tok = argv[i]
-        stripped = tok.strip().strip('"').strip("'")
-        # 拒绝含 shell 元字符的 token
-        if any(c in tok for c in ";|&$`><\n\r\\"):
+        stripped = tok.strip().strip(chr(34)).strip(chr(39))
+        if any(ch in tok for ch in shell_chars):
             i += 1
             continue
         if stripped in _SAFE_FLAGS:
             out.append(stripped)
         elif stripped in _SAFE_OPTS and i + 1 < len(argv):
-            val = argv[i + 1].strip().strip('"').strip("'")
-            # 注入防护：值中若含 shell 元字符（含路径分隔符 \）则整对丢弃。
-            # 例外：--out 的值由本进程自己生成（模板里写死），允许含 \ 与 /。
-            if stripped == "--out" and val and not any(c in val for c in ";|&$`>\n\r"):
-                out.append(stripped)
-                out.append(val)
-            elif stripped != "--out" and not any(c in val for c in ";|&$`><\n\r\\"):
-                out.append(stripped)
-                out.append(val)
+            val = argv[i + 1].strip().strip(chr(34)).strip(chr(39))
+            if stripped in ("--out", "--db"):
+                if not val or any(ch in val for ch in shell_chars.replace(chr(92), "")):
+                    raise ValueError(f"{stripped} 路径包含非法字符或为空")
+                out.extend((stripped, val))
+            elif any(ch in val for ch in shell_chars):
+                raise ValueError(f"{stripped} 参数包含非法字符")
+            else:
+                out.extend((stripped, val))
             i += 1
         elif stripped in KNOWN_KINDS:
             out.append(stripped)
@@ -1110,7 +1109,11 @@ def main(argv=None) -> int:
         i = argv.index("--arg-string")
         joined = " ".join(argv[i + 1:])
         argv = argv[:i] + _split_args(joined)
-    argv = _sanitize_args(argv)
+    try:
+        argv = _sanitize_args(argv)
+    except ValueError as exc:
+        print(f"MiMo 用量：参数错误（{exc}）", file=sys.stderr)
+        return 2
 
     args = parser.parse_args(argv)
     if args.kind not in KINDS:

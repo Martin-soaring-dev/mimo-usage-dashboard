@@ -194,6 +194,14 @@ def main() -> int:
     check("拒绝 && 拼接", U._sanitize_args(["token", "&&", "evil"]) == ["token"])
     check("拒绝反引号", U._sanitize_args(["`whoami`"]) == [])
     check("拒绝 $() ", U._sanitize_args(["$(calc)"]) == [])
+    win_db = r"C:\Users\Martin\mimocode.db"
+    check("保留 Windows --db 路径", U._sanitize_args(["--db", win_db]) == ["--db", win_db])
+    try:
+        U._sanitize_args(["--db", "C:\\safe.db; echo pwned"])
+        invalid_db_rejected = False
+    except ValueError:
+        invalid_db_rejected = True
+    check("拒绝非法 --db 路径而不静默回退", invalid_db_rejected)
     check("保留合法 kind", U._sanitize_args(["session"]) == ["session"])
     check("保留合法选项与值", U._sanitize_args(["--days", "7"]) == ["--days", "7"])
     check("丢弃未知选项", U._sanitize_args(["--evil", "x"]) == [])
@@ -219,7 +227,7 @@ def main() -> int:
     tpl = R.build_usage_template("python.exe", "usage_cli.py")
     shell_cmds = _re.findall(r"!`([^`]+)`", tpl)
     check("模板含且仅含 1 个 shell 命令", len(shell_cmds) == 1, f"({len(shell_cmds)})")
-    check("shell 命令经 --arg-string 透传", "--arg-string" in shell_cmds[0] if shell_cmds else False)
+    check("模板不透传用户参数到 shell", bool(shell_cmds) and "--arg-string" not in shell_cmds[0] and "$ARGUMENTS" not in shell_cmds[0])
     check("模板要求原样复述", "原样" in tpl)
 
     # ---- 收尾 ----

@@ -84,7 +84,7 @@ if (!template) {
 }
 check("模板含且仅含 1 个 shell 命令", [...template.matchAll(SHELL_REGEX)].length === 1);
 check("shell 命令中不含裸 $1/$2 拼接", !/\$\d+/.test(template.split("!`")[1]?.split("`")[0] || ""));
-check("参数经 --arg-string 透传（防注入）", template.includes("--arg-string"));
+check("模板不透传用户参数到 shell", !template.includes("$ARGUMENTS") && !template.includes("--arg-string"));
 check("指令要求只复述输出", /原样/.test(template) && /不要臆造/.test(template));
 
 console.log("\n=== 正常调用（默认 all） ===");
@@ -112,35 +112,21 @@ if (!CAN_SPAWN) {
   fs.rmSync(outDir, { recursive: true, force: true });
 }
 
-console.log("\n=== 参数透传（token --days 7） ===");
+console.log("\\n=== 固定命令调用 ===");
 if (!CAN_SPAWN) {
-  console.log("  SKIP  执行类断言已跳过（见 python test/test_python.py）");
+  console.log("  SKIP  执行类断言已跳过（见 test/test_python.py）");
 } else {
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-e2e-"));
-  const outFile = path.join(outDir, "t.html");
-  runPy([SCRIPT, "--arg-string", `token --days 7 --out "${outFile}"`]);
-  check("arg-string 被正确拆分执行", fs.existsSync(outFile));
-  const html = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : "";
-  // 面板是客户端渲染的，静态 HTML 里只嵌 `var DATA = {...}`。
-  // 因此断言 DATA 字段，而不是断言渲染后的字面文案。
-  check("kind=token 生效", /"kind"\s*:\s*"token"/.test(html));
-  check("days=7 生效", /"days"\s*:\s*7\b/.test(html));
+  const outFile = path.join(outDir, "usage.html");
+  const stdout = runPy([SCRIPT, "--out", outFile]);
+  check("固定命令正常生成 HTML", fs.existsSync(outFile));
+  check("固定命令返回简短结果", stdout.trim().split("\\n").length === 1);
   fs.rmSync(outDir, { recursive: true, force: true });
 }
 
-console.log("\n=== 注入防护 ===");
-if (!CAN_SPAWN) {
-  console.log("  SKIP  执行类断言已跳过（见 python test/test_python.py 的白名单用例）");
-} else {
-  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-e2e-"));
-  const canary = path.join(outDir, "PWNED.txt");
-  const outFile = path.join(outDir, "safe.html");
-  const evil = `token ; echo pwned > "${canary}" && --out "${outFile}"`;
-  const stdout = runPy([SCRIPT, "--arg-string", evil]);
-  check("恶意参数未被执行", !fs.existsSync(canary));
-  check("仍正常生成（白名单剔除非法 token）", stdout.includes("已生成"));
-  fs.rmSync(outDir, { recursive: true, force: true });
-}
+console.log("\\n=== 注入面检查 ===");
+check("模板中没有用户输入占位符", !template.includes("$ARGUMENTS"));
+check("模板命令中没有动态参数透传", !template.includes("--arg-string"));
 
 console.log(`\n${failures === 0 ? "COMMAND E2E OK" : "COMMAND E2E FAILED: " + failures}`);
 process.exit(failures === 0 ? 0 : 1);

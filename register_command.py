@@ -98,44 +98,26 @@ def q(s: str) -> str:
 
 
 def build_usage_template(py: str, script: str) -> str:
-    """主命令模板。
-
-    设计要点：
-      * 用 `` !`...` `` 让引擎**先在本地跑脚本**，stdout 插回文本；
-      * 用户参数经 `$ARGUMENTS` 透传，由脚本**白名单校验**；
-      * 指令要求模型**只复述脚本输出**，不臆造数字、不额外渲染。
-
-    ``$ARGUMENTS`` 必须用**单引号**包裹。引擎是先做 $ARGUMENTS 文本替换、再扫
-    shell 的（见 docs/architecture.md），所以模板里对用户输入的任何引用方式都会
-    原样进入命令行。选单引号的原因：
-
-      * Windows 上 ``shell.preferred()`` 选中 PowerShell，``'...'`` 是**字面字符串**，
-        内部的 ``;``、``&&``、``$()``、反引号、双引号全部不解释 → 注入面在 shell 层即被堵死；
-      * 若用双引号 ``"$ARGUMENTS"``，用户输入里一旦含 ``"`` 就会提前闭合、截断参数
-        （``--out "C:\\a b\\x.html"`` 会被拆坏）；
-      * 若完全不加引号，``;`` / ``&&`` 会被 PowerShell 当语法解析，整行报错。
-
-    脚本侧配套：``--arg-string`` 之后的所有 argv 元素拼回整串，再用
-    ``shlex.split(..., posix=True)`` 还原引号语义（usage_cli.py）。
-    """
-    cmd_all = f"{q(py)} {q(script)} --arg-string '$ARGUMENTS'"
+    """Build a fixed command; never interpolate untrusted arguments into shell text."""
+    cmd = f"{q(py)} {q(script)}"
     return (
         "用户请求查看 MiMo Desktop 本机用量。下面一行是本地脚本的真实输出"
-        "（已生成好静态 HTML 页面，脚本零 AI 参与、纯离线）：\n\n"
-        f"!`{cmd_all}`\n\n"
+        "（已生成好静态 HTML 页面，脚本零 AI 参与、纯离线）：\\n\\n"
+        f"!`{cmd}`\\n\\n"
         "请把上面这一行输出**原样**告诉用户，并提醒他打开该 HTML 文件即可看到"
-        "完整的用量看板（Token 用量 / Session 用量 / 上下文占用）。\n"
+        "完整的用量看板（Token 用量 / Session 用量 / 上下文占用）。"
+        "如需筛选某一类数据或指定日期，请直接运行本地 CLI。\\n"
         "不要臆造或改写任何数字，不要自己渲染图表，也不要额外调用其它工具。"
     )
 
 
 def build_open_template(py: str, script: str) -> str:
-    """同 build_usage_template，附加 --open。"""
-    cmd = f"{q(py)} {q(script)} --open --arg-string '$ARGUMENTS'"
+    """Build and open the overview without interpolating untrusted shell arguments."""
+    cmd = f"{q(py)} {q(script)} --open"
     return (
         "用户请求打开 MiMo Desktop 用量看板。下面一行是本地脚本的真实输出"
-        "（脚本已生成静态 HTML 并用默认浏览器打开）：\n\n"
-        f"!`{cmd}`\n\n"
+        "（脚本已生成静态 HTML 并用默认浏览器打开）：\\n\\n"
+        f"!`{cmd}`\\n\\n"
         "请把这一行原样告诉用户即可，不要臆造数字，不要调用其它工具。"
     )
 
