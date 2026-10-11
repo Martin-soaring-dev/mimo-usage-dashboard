@@ -1,27 +1,21 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "mimo-usage-dashboard",
-  "version": "0.1.2",
-  "description": "Local usage dashboard & plugin for MiMo Desktop — token usage, cache hit rate, model share, and a 12-month heatmap, all read locally.",
+  "version": "0.2.0",
+  "description": "MiMo Desktop local usage dashboard — a zero-AI Python CLI that renders static HTML (token usage, cache hit rate, model share, session stats, context occupancy). No server, no ports, no network.",
   "type": "module",
   "license": "MIT",
   "author": "Martin-soaring-dev",
-  "main": "index.mjs",
-  "exports": {
-    ".": "./index.mjs"
-  },
   "files": [
-    "index.mjs",
-    "server.mjs",
-    "usage-core.mjs",
-    "dashboard.html",
-    "docs",
-    "plugin",
-    "skill",
+    "usage_cli.py",
+    "register_command.py",
     "install.ps1",
-    "register-plugin.mjs",
-    "start-dashboard.cmd",
+    "usage.cmd",
+    "skill",
+    "docs",
+    "test",
     "README.md",
+    "README.en.md",
     "LICENSE"
   ],
   "keywords": [
@@ -30,12 +24,13 @@
     "mimocode",
     "xiaomi",
     "opencode",
-    "plugin",
     "usage",
     "dashboard",
     "tokens",
     "cache",
-    "heatmap"
+    "heatmap",
+    "python",
+    "cli"
   ],
   "repository": {
     "type": "git",
@@ -46,23 +41,23 @@
   },
   "homepage": "https://github.com/Martin-soaring-dev/mimo-usage-dashboard#readme",
   "scripts": {
-    "check": "node --check index.mjs && node --check plugin/usage-dashboard.mjs && node --check server.mjs && node --check usage-core.mjs && node --check test/smoke.mjs && node --check desktop-patch/renderer-menu-patch.js && node --check desktop-patch/patch.mjs",
-    "smoke": "node test/smoke.mjs",
-    "test": "npm run check && npm run smoke",
-    "server": "node server.mjs --open",
-    "desktop:inspect": "node desktop-patch/patch.mjs inspect",
-    "desktop:dry-run": "node desktop-patch/patch.mjs dry-run",
-    "desktop:patch": "node desktop-patch/patch.mjs apply",
-    "desktop:restore": "node desktop-patch/patch.mjs restore"
+    "usage": "python usage_cli.py --open",
+    "usage:all": "python usage_cli.py all",
+    "usage:token": "python usage_cli.py token",
+    "usage:session": "python usage_cli.py session",
+    "usage:context": "python usage_cli.py context",
+    "register": "python register_command.py",
+    "unregister": "python register_command.py --uninstall",
+    "test": "python test/test_python.py",
+    "test:node": "node test/command-e2e.mjs",
+    "test:runtime": "node test/runtime-check.mjs",
+    "test:live": "python test/e2e_live.py",
+    "test:all": "python test/test_python.py && node test/runtime-check.mjs && node test/command-e2e.mjs && python test/e2e_live.py"
   },
-  "dependencies": {
-    "@mimo-ai/plugin": "^0.1.15"
+  "engines": {
+    "python": ">=3.10"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
-  "devDependencies": {
-    "@electron/asar": "^4.3.1"
+    "access": "public"
   }
 }

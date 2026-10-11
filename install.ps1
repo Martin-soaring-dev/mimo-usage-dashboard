@@ -1,90 +1,91 @@
-# Install MiMo Desktop Usage Dashboard (dashboard + plugin + skill)
+# Install MiMo Desktop Usage Dashboard (Python CLI + /usage command)
 # Usage:  powershell -ExecutionPolicy Bypass -File install.ps1
+#
+# 本脚本做两件事：
+#   1) 把 usage_cli.py / register_command.py 拷到 ~/.config/mimocode/usage-dashboard/
+#   2) 往 mimocode.jsonc 的 `command` 字段写入 /usage 与 /usage-open
+#
+# 不安装插件、不启动服务、不监听端口。
 [CmdletBinding()]
 param(
-  [int]$Port = 8790
+  # 显式指定 python.exe；不传则自动探测
+  [string]$Python = ""
 )
 
 $ErrorActionPreference = "Stop"
 $src  = $PSScriptRoot
 $mimo = Join-Path $env:USERPROFILE ".config\mimocode"
+$dest = Join-Path $mimo "usage-dashboard"
 
 Write-Host "== MiMo Desktop Usage Dashboard - install ==" -ForegroundColor Cyan
 
-# 1) locate Node (needs >= 22 for node:sqlite)
-function Resolve-Node {
+# 1) locate Python (>= 3.10; 只用标准库)
+function Resolve-Python {
+  param([string]$Hint)
   $cands = @()
-  $cmd = Get-Command node -ErrorAction SilentlyContinue
+  if ($Hint) { $cands += $Hint }
+  $cmd = Get-Command python -ErrorAction SilentlyContinue
   if ($cmd) { $cands += $cmd.Source }
+  $cmd3 = Get-Command python3 -ErrorAction SilentlyContinue
+  if ($cmd3) { $cands += $cmd3.Source }
   $cands += @(
-    "C:\Program Files\nodejs\node.exe",
-    (Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe"),
-    (Join-Path $env:USERPROFILE ".bun\bin\node.exe")
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
+    "C:\Python313\python.exe",
+    "C:\Python312\python.exe"
   )
-  foreach ($c in $cands) { if ($c -and (Test-Path $c)) { return (Resolve-Path $c).Path } }
+  foreach ($c in $cands) {
+    if ($c -and (Test-Path $c)) { return (Resolve-Path $c).Path }
+  }
   return $null
 }
 
-$node = Resolve-Node
-if (-not $node) {
-  Write-Warning "node.exe not found. Install Node.js 22+ or set MIMO_USAGE_NODE to node.exe."
-  $node = "node"
+$py = Resolve-Python -Hint $Python
+if (-not $py) {
+  Write-Warning "python.exe not found. Install Python 3.10+ and re-run, or pass -Python <path>."
+  $py = "python"
 } else {
   try {
-    $ver = (& $node --version) -replace '^v', ''
-    $major = [int]($ver.Split('.')[0])
-    Write-Host "Node: $node (v$ver)"
-    if ($major -lt 22) { Write-Warning "Node $ver is too old; node:sqlite needs 22+. The dashboard may fail to read the database." }
-  } catch { Write-Warning "Could not read node version." }
+    $ver = (& $py --version) 2>&1
+    Write-Host "Python: $py ($ver)"
+  } catch { Write-Warning "Could not read python version." }
 }
 
-# 2) copy dashboard code
-$dash = Join-Path $mimo "usage-dashboard"
-New-Item -ItemType Directory -Force -Path $dash | Out-Null
-Copy-Item (Join-Path $src "usage-core.mjs") $dash -Force
-Copy-Item (Join-Path $src "server.mjs")     $dash -Force
-Copy-Item (Join-Path $src "dashboard.html") $dash -Force
-Write-Host "dashboard -> $dash"
+# 2) copy the CLI
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Copy-Item (Join-Path $src "usage_cli.py")        $dest -Force
+Copy-Item (Join-Path $src "register_command.py") $dest -Force
+Write-Host "cli       -> $dest"
 
-# 3) write config (no BOM: some readers choke on a leading U+FEFF)
-$cfg  = Join-Path $mimo "usage-dashboard.config.json"
-$json = [ordered]@{ dashboardDir = $dash; nodePath = $node; port = $Port } | ConvertTo-Json
-[System.IO.File]::WriteAllText($cfg, $json, (New-Object System.Text.UTF8Encoding($false)))
-Write-Host "config    -> $cfg"
-
-# 4) install plugin + register it in the user config
-#    (the engine only globs "{plugin,plugins}/*.{ts,js}" in the plugin dir, so a .mjs
-#     must be registered via the config `plugin` array - same as the app's own plugin)
-$plugDir = Join-Path $mimo "plugin"
-New-Item -ItemType Directory -Force -Path $plugDir | Out-Null
-$pluginFile = Join-Path $plugDir "usage-dashboard.mjs"
-Copy-Item (Join-Path $src "plugin\usage-dashboard.mjs") $pluginFile -Force
-Write-Host "plugin    -> $pluginFile"
-
-$uri     = ([uri]$pluginFile).AbsoluteUri
-$cfgUser = Join-Path $mimo "mimocode.jsonc"
-if (Test-Path $cfgUser) {
+# 3) register the /usage command into mimocode.jsonc (JSONC-aware)
+$cfg = Join-Path $mimo "mimocode.jsonc"
+if (Test-Path $cfg) {
   try {
-    $res = & $node (Join-Path $src "register-plugin.mjs") $cfgUser $uri
-    Write-Host "registered -> $cfgUser  [$res]"
-  } catch { Write-Warning "Registering the plugin failed: $_" }
+    $out = & $py (Join-Path $dest "register_command.py") --config $cfg `
+              --python $py --script (Join-Path $dest "usage_cli.py")
+    Write-Host "command   -> $cfg  [$out]"
+  } catch {
+    Write-Warning "Registering the command failed: $_"
+  }
 } else {
-  Write-Warning "Config not found: $cfgUser"
-  Write-Warning "Add this to its 'plugin' array manually: $uri"
+  Write-Warning "Config not found: $cfg"
+  Write-Warning "Create it, then re-run this script."
 }
 
-# 5) install skill (shows up on the Plugins page)
-$skillDst = Join-Path $mimo "skills\mimo-usage-dashboard"
-New-Item -ItemType Directory -Force -Path (Join-Path $skillDst "locales") | Out-Null
-Copy-Item (Join-Path $src "skill\SKILL.md") $skillDst -Force
-Copy-Item (Join-Path $src "skill\locales\*.json") (Join-Path $skillDst "locales") -Force
-Write-Host "skill     -> $skillDst"
+# 4) remove any legacy skill left over from the old (AI-routed) design
+foreach ($legacy in @("skills\usage", "skills\mimo-usage-dashboard", "usage-dashboard.config.json",
+                      "plugin\usage-dashboard.mjs")) {
+  $p = Join-Path $mimo $legacy
+  if (Test-Path $p) {
+    Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "removed legacy -> $p" -ForegroundColor DarkYellow
+  }
+}
 
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green
-Write-Host "  Start dashboard : node `"$dash\server.mjs`" --port $Port --open"
-Write-Host "  Or double-click : $(Join-Path $src 'start-dashboard.cmd')"
-Write-Host "  In MiMo Desktop : open a NEW session and say 'show my usage' / 'open the usage dashboard'."
-Write-Host "  URL             : http://127.0.0.1:$Port"
+Write-Host "  Try it now   : & `"$py`" `"$dest\usage_cli.py`" --open"
+Write-Host "  In MiMo      : open a NEW session and type /usage   (or /usage token, /usage session, /usage context)"
+Write-Host "  Uninstall    : & `"$py`" `"$dest\register_command.py`" --uninstall"
 Write-Host ""
-Write-Host "Note: plugin/skill take effect in a NEW session." -ForegroundColor Yellow
+Write-Host "Note: /usage takes effect in a NEW session (the engine builds the command table at session start)." -ForegroundColor Yellow

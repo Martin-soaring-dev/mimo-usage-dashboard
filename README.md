@@ -3,225 +3,207 @@
 > 看清明 MiMo Desktop 的 token 都花在哪了。
 
 [![release](https://img.shields.io/github/v/release/Martin-soaring-dev/mimo-usage-dashboard?label=release&color=orange)](https://github.com/Martin-soaring-dev/mimo-usage-dashboard/releases)
-[![npm](https://img.shields.io/npm/v/mimo-usage-dashboard?label=npm&color=cb3837)](https://www.npmjs.com/package/mimo-usage-dashboard)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](#%E5%AE%89%E8%A3%85)
-[![MiMo Desktop](https://img.shields.io/badge/MiMo%20Desktop-plugin-lightgrey)](https://mimo.xiaomi.com/coder)
-[![node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen)](#%E7%9B%B4%E6%8E%A5%E8%B7%91%E4%BB%AA%E8%A1%A8%E7%9B%98%E4%B8%8D%E8%A3%85%E6%8F%92%E4%BB%B6%E4%B9%9F%E8%A1%8C)
+[![MiMo Desktop](https://img.shields.io/badge/MiMo%20Desktop-%2Fusage-lightgrey)](https://mimo.xiaomi.com/coder)
+[![python](https://img.shields.io/badge/python-%E2%89%A53.10-brightgreen)](#%E5%AE%89%E8%A3%85)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/Martin-soaring-dev/mimo-usage-dashboard/ci.yml?label=CI&logo=github)](https://github.com/Martin-soaring-dev/mimo-usage-dashboard/actions)
 
 简体中文 · [English](./README.en.md)
 
-给 **MiMo Desktop**（内置 MiMoCode 引擎，OpenCode 分支）用的本地用量统计：
-一个**本地网页仪表盘** + 一个 **MiMoCode 插件** + 一个**技能**。所有数据在本机读取，不出网。
+给 **MiMo Desktop**（内置 MiMoCode 引擎，OpenCode 分支）做**本机**用量统计：
+一个**本地命令行**，把用量渲染成**自包含的静态 HTML 看板**。
 
-- 总 tokens、会话 / 请求 / 工具 / 改动
-- 输入 / 输出拆分、**缓存命中率**
-- **12 个月 token 热力图**（自适应铺满，格子悬停显示日期与 token）
-- 模型份额（深 / 浅 = 未命中 / 命中缓存）
-- 每日 tokens 曲线、每日活跃会话；**「今日」按小时**
-- 每 5 分钟自动刷新
+**零 AI 参与、零常驻服务、零端口、零联网。**
 
-> **为什么是网页而不是应用内页面？** MiMo 的插件 API（`@mimo-ai/plugin`）只能注册 agent 工具，
-> **不能往应用界面注入自定义页面**。所以图表界面用本地网页实现，由插件/技能负责打开。
+```
+/usage  ─►  引擎本地执行 python usage_cli.py
+        ─►  脚本只读 mimocode.db → 聚合 → 渲染静态 HTML → 写入当前目录
+        ─►  AI 只把这行结果原样转述
+```
 
-![预览](https://raw.githubusercontent.com/Martin-soaring-dev/mimo-usage-dashboard/main/docs/preview.svg)
+### Token 页的区块顺序
+
+1. **Hero 大卡** — 范围内 tokens 总量 + 最近 30 天迷你趋势
+2. **8 个统计小卡**（2×4）— 输入 / 输出 / 缓存读取 / 缓存命中率 / 请求数 / 工具调用 / 会话数 / 平均每次请求
+3. **Token 热力图** — 最近 12 个月 × 每日 tokens，GitHub 风格 4 档分位配色（**不受 `--days` 限制**，始终看全年）
+4. **按模型的调用情况** — 每个模型一行：token 总量、请求 / 工具数、占比条、**缓存命中率条**（浅蓝=命中、橙=未命中）
+
+配色语义互不混用：
+
+| 区块 | 配色 |
+|---|---|
+| 模型行命中率条 | 浅蓝=命中，**橙=未命中（警示）** |
+| 上下文构成条 | 浅蓝=缓存读取，蓝=新输入，紫=推理，绿=输出 |
+
+- **Session 用量**：会话总数、累计 tokens、改动行 / 文件数、最近会话明细
+- **上下文占用**：当前会话上下文 tokens、构成（缓存读取 / 新输入 / 推理 / 输出）、模型、工作目录
+
+## 为什么是「本地命令 + 静态网页」
+
+两条来自 MiMo 应用本体的硬约束（详见 [`docs/architecture.md`](./docs/architecture.md)）：
+
+1. **插件 API 只有服务端能力**。`@mimo-ai/plugin` 只能注册 agent 工具，
+   **不能往应用界面注入自定义页面**（右侧面板菜单是编译进 bundle 的常量）。
+2. **对话内的 `sci-widget` 卡片必须由 AI 逐字输出 HTML**。只要卡片 HTML 由 AI 流式生成，
+   正文里就会经历一段「正在生成交互演示…」的等待，还消耗大量 token。
+
+于是改走**第三条路**：让 MiMo 引擎的 `command` 机制**先在本地执行脚本**。
+
+引擎内置 shell 替换语法（`src/config/markdown.ts` 的 `SHELL_REGEX`）：
+写在 `command.template` 里的反引号命令会在**本地真实执行**，stdout 插回文本 ——
+这就是 qwen code `/update` 那种**确定性本地函数**。
+
+| | 旧方案（v0.1.x） | 新方案（v0.2+） |
+|---|---|---|
+| `/usage` 机制 | 技能 → AI 理解 → AI 调工具 → AI 贴结果 | `command` + 本地 shell 替换 → **本地执行** |
+| AI 参与 | 必须（两跳） | **仅复述一行输出** |
+| 服务 | 常驻 `127.0.0.1:8790` | **无** |
+| 对话内卡片 | `sci-widget`（AI 逐字输出 HTML） | 静态 HTML 文件 |
+| 运行时 | Node ≥ 22 | **Python ≥ 3.10（仅标准库）** |
 
 ## 安装
 
-安装后 **重启 MiMo Desktop**，再新开一个会话。
+### 方式 A：一键脚本（Windows）
 
-### 方式 A：npm（推荐）
+```powershell
+git clone https://github.com/Martin-soaring-dev/mimo-usage-dashboard
+cd mimo-usage-dashboard
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
 
-在 `~/.config/mimocode/mimocode.jsonc`（或项目 `.mimocode/mimocode.json`）里加一行：
+脚本会：把 CLI 拷到 `~/.config/mimocode/usage-dashboard/`，并把 `command.usage` /
+`command.usage-open` 写进 `mimocode.jsonc`，同时清理旧版遗留的技能与配置。
+
+安装后**彻底重启 MiMo Desktop**，再**新开一个会话**。
+
+### 方式 B：手动
+
+1. 把 `usage_cli.py` 与 `register_command.py` 放到任意目录（例如 `D:\tools\mimo-usage\`）。
+2. 在 `~/.config/mimocode/mimocode.jsonc` 里加一个 `command` 段：
 
 ```jsonc
 {
-  "plugin": ["mimo-usage-dashboard"]
+  "command": {
+    "usage": {
+      "description": "MiMo Desktop 本机用量看板",
+      "template": "用户请求查看用量。下面一行是本地脚本的真实输出：\n\n<反引号 shell 命令>\n\n请把这一行原样告诉用户，不要臆造数字。"
+    }
+  }
 }
 ```
 
-引擎会自动 `npm install` 该包。
+其中 shell 命令写作：`!` + 反引号包裹的 `python <路径>\usage_cli.py --arg-string '$ARGUMENTS'`。
 
-### 方式 B：GitHub 源
+> **`$ARGUMENTS` 必须用单引号包裹**，别改成双引号或不加引号 ——
+> 引擎是先替换 `$ARGUMENTS`、再扫 shell 的，包裹方式直接决定安全性。
+> 三种写法的实测差异见 [docs/architecture.md §5.1](docs/architecture.md)。
+>
+> 注意：模板里的 shell 指令是**真指令**，引擎会执行它 —— 不要写进注释或示例里。
+> 也可以直接跑 `python register_command.py` 让它自动写入。
 
-```jsonc
-{ "plugin": ["github:Martin-soaring-dev/mimo-usage-dashboard"] }
-
-// 无 git 环境时更稳，纯 https tarball：
-{ "plugin": ["https://github.com/Martin-soaring-dev/mimo-usage-dashboard/archive/refs/heads/main.tar.gz"] }
-```
-
-### 方式 C：Windows 一键脚本
-
-```powershell
-irm https://raw.githubusercontent.com/Martin-soaring-dev/mimo-usage-dashboard/main/install.ps1 | iex
-```
-
-脚本会：把看板代码拷到 `~/.config/mimocode/usage-dashboard/`，把 `file://…/plugin/usage-dashboard.mjs`
-写进配置的 `plugin` 数组，并安装技能（出现在「插件」页）。
-
-### 方式 D：手动 clone + `file://`
+### 方式 C：只想直接看，不装命令
 
 ```bash
-git clone https://github.com/Martin-soaring-dev/mimo-usage-dashboard
+python usage_cli.py --open          # 需要 Python ≥ 3.10，无第三方依赖
 ```
 
-再把 `file:///…/mimo-usage-dashboard/plugin/usage-dashboard.mjs` 加进 `plugin` 数组。
-
-### 直接跑仪表盘（不装插件也行）
-
-```bash
-node server.mjs --open   # 需要 Node.js >= 22（用了内置 node:sqlite）
-```
-
-> **为什么是 `.mjs` 还要写进 `plugin` 数组？** MiMo 的插件目录扫描是 `{plugin,plugins}/*.{ts,js}`，**不含 `.mjs`**；
-> `.mjs` 需像自带插件那样通过 `plugin` 数组以 `file://` 注册。
+Windows 也可以直接**双击 `usage.cmd`**。
 
 ## 使用
 
-在 MiMo Desktop 里：
+### `/usage`（推荐）
 
-- 说「**看我的用量 / token 消耗 / 用量统计**」→ 调用 `usage_stats`，对话里返回 Markdown 摘要。
-- 说「**打开用量仪表盘**」→ 调用 `usage_dashboard`，启动本地服务并在默认浏览器打开（地址也可粘进 MiMo 内置浏览器）。
-- 技能「用量统计仪表盘」会出现在 **插件页**。
+| 输入 | 效果 |
+|---|---|
+| `/usage` | 生成总览页（Token + Session + 上下文三合一） |
+| `/usage token` | 只生成 Token 用量页 |
+| `/usage session` | 只生成 Session 用量页 |
+| `/usage context` | 只生成上下文占用页 |
+| `/usage token --days 7` | 最近 7 天 |
+| `/usage-open` | 生成并用默认浏览器打开 |
 
-直接打开仪表盘：`http://127.0.0.1:8790`。
+生成的文件默认落在**当前工作目录**：`mimo-usage-<kind>-<日期>.html`。
 
-### 实验性：在桌面头像菜单增加「用量统计」
+### 直接跑 CLI
 
-MiMo Desktop 没有公开的 React/侧边栏 UI 插件接口。仓库提供一个**可选的 app.asar 补丁**，在头像菜单的「剩余用量」下面插入「用量统计」，点击后以弹窗 iframe 打开完整仪表盘。补丁会先备份原始 app.asar 和 app.asar.unpacked，支持还原；它**不是官方支持的插件扩展点**。
-
-1. 克隆此仓库，在仓库目录安装开发依赖并检查：
-
-   ```powershell
-   npm install
-   # 只读检查安装位置
-   npm run desktop:inspect
-   # 在临时目录抽取、注入并重打包验证；不改已安装 App
-   npm run desktop:dry-run
-   ```
-
-2. 运行 `install.ps1` 安装仓库中的最新插件文件（插件初始化时会启动本机服务），然后完全退出 MiMo Desktop，包括托盘进程：
-
-   ```powershell
-   .\install.ps1
-   ```
-
-3. 在**管理员 PowerShell**中进入仓库目录并运行：
-
-   ```powershell
-   npm run desktop:patch
-   ```
-
-4. 重开 MiMo Desktop，打开左下角头像菜单，点「用量统计」。
-
-还原原版：完全退出 MiMo Desktop，在管理员 PowerShell 中运行 `npm run desktop:restore`。
-
-> **风险与限制**：应用升级可能覆盖补丁；升级后需重新运行补丁。此补丁会重打包官方 app.asar，只建议个人本机使用。若启动异常，退出应用后运行还原命令。不要把改过的 app.asar 分发给他人。
-
-## 扩展面（想加"入口/按钮"必读）
-
-MiMo 的**引擎**开源（[XiaomiMiMo/MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code)，MIT），但**桌面应用闭源**。
-右侧面板的 "+" 菜单、侧边栏 tab 都是编译进 bundle 的常量，**只能靠 app.asar 补丁**；插件体系能加的"入口"是
-composer 的 `/` 菜单（Command / Skill / MCP）和对话内的 `sci-widget`、产物 / 内置浏览器。
-
-详细接口清单、代码证据与三条可选路线见 [`docs/extensibility.md`](./docs/extensibility.md)。
-
-## 工作原理
-
-```
-MiMo Desktop ──► mimocode.db ──► usage-core.mjs ──► server.mjs ──► dashboard.html
-                     ▲                                              (http://127.0.0.1:8790)
-                     └── plugin/usage-dashboard.mjs ── 工具 usage_stats / usage_dashboard
+```bash
+python usage_cli.py                     # 总览
+python usage_cli.py token --days 7      # 近 7 天 token
+python usage_cli.py session             # 会话明细
+python usage_cli.py context             # 上下文占用
+python usage_cli.py --open              # 生成并打开
+python usage_cli.py --out D:/x.html     # 指定输出
+python usage_cli.py --db <path>         # 指定数据库
+python usage_cli.py --print-path        # 只打印路径（便于脚本串联）
 ```
 
-- **数据层** `usage-core.mjs`：只读 `mimocode.db` 并聚合（若库被占用则做临时快照）。
-- **服务** `server.mjs`：仅监听 `127.0.0.1`，提供 `/`、`/api/usage`、`/api/summary`、`/api/ping`。
-- **插件** `plugin/usage-dashboard.mjs`：注册两个工具；自带定位看板文件（npm 安装）或读 `usage-dashboard.config.json`（脚本安装）。
-- **技能** `skill/`：让 agent 知道何时调用工具。
+### 刷新数据
+
+HTML 是**静态快照**（页面上的「重新生成」按钮只是提示你重跑命令，不请求任何服务）。
+重新运行同一个命令即可。
 
 ## 指标口径
 
 | 指标 | 计算方式 |
 |---|---|
 | **tokens 消耗** | 输入 + 输出 |
-| **输入 tokens** | `tokens.input` + `tokens.cache.read` |
-| **输出 tokens** | `tokens.output` + `tokens.reasoning` |
+| **输入 tokens** | `tokens.input + tokens.cache.read` |
+| **输出 tokens** | `tokens.output + tokens.reasoning` |
 | **缓存命中率** | `cache.read / (tokens.input + cache.read)` |
 | **会话 / 请求 / 工具** | `session` 行数 / assistant 消息数 / `part` 中 `type==="tool"` 数 |
 | **改动** | `session` 的 `summary_additions + summary_deletions`（含文件数） |
+| **上下文占用** | 该会话最新 `step-finish` part 的 `tokens.total`（无则退回最新 assistant 消息） |
 
 数据来自 `~/.local/share/mimocode/mimocode.db` 的 `message` / `part` / `session` 表。
+
+## 安全与隐私
+
+- **不联网**、不上传任何数据、不监听任何端口。
+- 数据库**仅只读**打开（`mode=ro`）；被占用时复制一份临时快照再读，**绝不写库**。
+- 命令参数走**白名单校验**：`$ARGUMENTS` 会被拆解并剔除任何含 shell 元字符的 token，
+  防止用户输入造成命令注入。详见 `usage_cli.py` 的 `_sanitize_args`。
 
 ## 仓库结构
 
 ```
-index.mjs                   包入口（导出插件函数）
-package.json                npm 包清单
-plugin/usage-dashboard.mjs  MiMoCode 插件（usage_stats / usage_dashboard）
-usage-core.mjs              数据层：读库并聚合
-server.mjs                  本地 HTTP 服务（仅 127.0.0.1）
-dashboard.html              仪表盘页面（自带 SVG 图表，无外部依赖）
-skill/                      技能（Plugins 页显示）
-docs/extensibility.md       扩展面调研（插件/MCP/命令/sci-widget/产物 等接口清单）
-desktop-patch/              实验性 app.asar 补丁（右侧/头像菜单注入 + 还原）
-install.ps1 / register-plugin.mjs / start-dashboard.cmd
-test/smoke.mjs              冒烟测试
-.github/workflows/          CI 与发布
+usage_cli.py                核心：只读 db → 聚合 → 渲染自包含 HTML（纯标准库）
+register_command.py         把 /usage 与 /usage-open 写进 mimocode.jsonc（JSONC 感知）
+install.ps1                 Windows 一键安装
+usage.cmd                   双击即用（生成 + 打开）
+skill/usage/                /usage 命令说明
+skill/mimo-usage-dashboard/ 用量看板说明（纯文档，不执行任何操作）
+docs/architecture.md        架构与引擎机制实证（命令注册、shell 替换、为何弃用服务）
+docs/plugin-interface.md    MiMo 插件接口调研（Hooks / ToolContext / 加载机制）
+test/test_python.py         Python 端到端测试（聚合口径 / 视图 / 注入防护 / JSONC）
+test/command-e2e.mjs        Node 侧：模拟引擎的模板替换与 shell 提取
 ```
 
 ## 开发
 
 ```bash
-npm install
-npm test          # 语法检查 + 冒烟测试
-npm run server    # 本地起仪表盘
-npm pack --dry-run
-npm run desktop:inspect # 查看本机 MiMo asar 信息；只读
+npm test                    # = python test/test_python.py（51 项断言）
+node test/command-e2e.mjs   # 模板形状与引擎行为模拟
+python usage_cli.py --open  # 手动查看
 ```
-
-## 发布（维护者）
-
-推一个 `v*` tag 即触发 `.github/workflows/release.yml`：
-
-```bash
-git tag v0.1.1
-git push origin v0.1.1
-```
-
-工作流：跑测试 → 用 tag 号覆盖 `package.json` 版本 → `npm publish --provenance --access public` → 建 GitHub Release。
-认证使用仓库 Secret `NPM_TOKEN`（npm 的 **Granular token**，勾选 *Bypass two-factor authentication*，
-Permissions = `Read and write (publish and stage)`，Select packages = `All Packages`）。
-
-> 也可改用 npm **Trusted Publishing**（OIDC，免 token）：在 npm 包页配置 Trusted Publisher 指向本仓库 + `release.yml`，
-> 然后删除工作流里的 `NODE_AUTH_TOKEN`。
-
-## 安全与隐私
-
-- 服务只监听 `127.0.0.1`，**不上传任何数据**。
-- 数据库**仅只读**打开；被占用时做一份临时快照再读，**绝不写库**。
 
 ## 排错
 
-- **对话里没有 `usage_stats`**：确认 `plugin` 数组含该条目，然后**彻底重启** MiMo Desktop。
-- **工具报「服务启动超时」**：需要系统 `node` ≥ 22，或设环境变量 `MIMO_USAGE_NODE` 指向 `node.exe` 全路径。
-- **端口被占**：`--port` 换端口，并同步 `usage-dashboard.config.json` 的 `port`。
-- **数据不更新**：页面每 5 分钟自动刷新，也可点「刷新」。
+- **输入 `/usage` 没反应**：确认 `mimocode.jsonc` 里有 `command.usage`，然后**彻底重启** MiMo Desktop，再**新开一个会话**（引擎在会话开始时构建命令表）。
+- **报错 `找不到 MiMo 数据库`**：确认 MiMo Desktop 至少成功用过一次；或用 `--db` 指定路径 / 设 `MIMO_USAGE_DB`。
+- **报错找不到 Python**：装 Python ≥ 3.10，或 `install.ps1 -Python <python.exe 路径>`。
+- **页面打不开**：确认文件已生成（CLI 会打印绝对路径）；或改用 `--open`。
+- **上下文显示「上限未知」**：该模型不在内置上限表里，只展示占用绝对值；可用 `--limit` 显式指定。
 
 ## 卸载
 
-```powershell
-Remove-Item "$env:USERPROFILE\.config\mimocode\usage-dashboard" -Recurse -Force
-Remove-Item "$env:USERPROFILE\.config\mimocode\plugin\usage-dashboard.mjs" -Force
-Remove-Item "$env:USERPROFILE\.config\mimocode\skills\mimo-usage-dashboard" -Recurse -Force
-Remove-Item "$env:USERPROFILE\.config\mimocode\usage-dashboard.config.json" -Force
+```bash
+python register_command.py --uninstall          # 从 mimocode.jsonc 移除命令
 ```
 
-再从 `plugin` 数组里删掉那条 `usage-dashboard.mjs`（脚本安装时的备份在 `mimocode.jsonc.bak-usage-dashboard`）。
+再删除 `~/.config/mimocode/usage-dashboard/` 即可。
 
 ## License
 
 MIT © Martin-soaring-dev
 
-> 本项目为**非官方**第三方插件，与小米 / MiMo 无关。
+> 本项目为**非官方**第三方工具，与小米 / MiMo 无关。

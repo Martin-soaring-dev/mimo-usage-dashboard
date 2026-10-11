@@ -3,228 +3,167 @@
 > See where your MiMo Desktop tokens actually go.
 
 [![release](https://img.shields.io/github/v/release/Martin-soaring-dev/mimo-usage-dashboard?label=release&color=orange)](https://github.com/Martin-soaring-dev/mimo-usage-dashboard/releases)
-[![npm](https://img.shields.io/npm/v/mimo-usage-dashboard?label=npm&color=cb3837)](https://www.npmjs.com/package/mimo-usage-dashboard)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](#install)
-[![MiMo Desktop](https://img.shields.io/badge/MiMo%20Desktop-plugin-lightgrey)](https://mimo.xiaomi.com/coder)
-[![node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen)](#run-the-dashboard-standalone)
+[![MiMo Desktop](https://img.shields.io/badge/MiMo%20Desktop-%2Fusage-lightgrey)](https://mimo.xiaomi.com/coder)
+[![python](https://img.shields.io/badge/python-%E2%89%A53.10-brightgreen)](#install)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/Martin-soaring-dev/mimo-usage-dashboard/ci.yml?label=CI&logo=github)](https://github.com/Martin-soaring-dev/mimo-usage-dashboard/actions)
 
-English · [简体中文](./README.md)
+[简体中文](./README.md) · English
 
-Local usage statistics for **MiMo Desktop** (the embedded MiMoCode engine, an OpenCode fork):
-a **local web dashboard** + a **MiMoCode plugin** + a **skill**. Everything is read locally — nothing leaves your machine.
+Local usage stats for **MiMo Desktop** (built on the MiMoCode engine, an OpenCode fork):
+a single **local command** that renders usage into a **self-contained static HTML dashboard**.
 
-- Total tokens, sessions / requests / tools / edits
-- Input / output split, **cache hit rate**
-- **12-month token heatmap** (fills the card, cells show date + tokens on hover)
-- Model share (dark / light = cache-miss / cache-hit)
-- Daily tokens curve and daily active sessions; **"Today" is hourly**
-- Auto-refreshes every 5 minutes
+**Zero AI involvement, no long-running server, no ports, no network.**
 
-> **Why a web page instead of an in-app page?** The MiMo plugin API (`@mimo-ai/plugin`) can only register
-> agent tools — it **cannot inject custom UI into the app**. So the charts live in a local web page that the
-> plugin/skill opens for you.
+```
+/usage  ─►  the engine runs `python usage_cli.py` locally
+        ─►  the script reads mimocode.db → aggregates → renders static HTML → writes to cwd
+        ─►  the AI just relays that one line
+```
 
-![preview](https://raw.githubusercontent.com/Martin-soaring-dev/mimo-usage-dashboard/main/docs/preview.svg)
+- **Token usage**: total tokens, input/output split, **cache hit rate**, requests/tool calls, daily sparkline
+- **Model share**: per-model token share (with each model's cache hit rate)
+- **Session usage**: session count, cumulative tokens, lines/files changed, recent session table
+- **Context occupancy**: current session's context tokens, composition (cache read / fresh input / reasoning / output), model, working directory
+
+## Why "local command + static page"
+
+Two hard constraints in the MiMo app itself (see [`docs/architecture.md`](./docs/architecture.md)):
+
+1. **The plugin API is server-side only.** `@mimo-ai/plugin` can register agent tools but
+   **cannot inject custom pages into the UI** (the right-panel menu is a compile-time constant).
+2. **Inline `sci-widget` cards must be written out by the AI, token by token.** While the HTML streams,
+   the chat shows a "generating interactive demo…" placeholder and burns a lot of tokens.
+
+So we take a **third path**: let the engine's `command` mechanism **run a local script first**.
+
+The engine has built-in shell substitution (`src/config/markdown.ts`, `SHELL_REGEX`): a backtick-wrapped
+command inside `command.template` is **actually executed locally**, and its stdout is spliced back into
+the text — exactly the kind of deterministic local function that qwen code's `/update` provides.
+
+| | Old (v0.1.x) | New (v0.2+) |
+|---|---|---|
+| `/usage` mechanism | skill → AI understands → AI calls tool → AI pastes result | `command` + local shell substitution |
+| AI involvement | required (two hops) | **relays one line only** |
+| Server | always-on `127.0.0.1:8790` | **none** |
+| Inline card | `sci-widget` (AI writes HTML) | static HTML file |
+| Runtime | Node ≥ 22 | **Python ≥ 3.10 (stdlib only)** |
 
 ## Install
 
-After installing, **restart MiMo Desktop** and open a new session.
-
-### Option A: npm (recommended)
-
-Add one line to `~/.config/mimocode/mimocode.jsonc` (or project `.mimocode/mimocode.json`):
-
-```jsonc
-{
-  "plugin": ["mimo-usage-dashboard"]
-}
-```
-
-The engine installs the package from npm automatically.
-
-### Option B: from GitHub
-
-```jsonc
-{ "plugin": ["github:Martin-soaring-dev/mimo-usage-dashboard"] }
-
-// more robust without git (plain https tarball):
-{ "plugin": ["https://github.com/Martin-soaring-dev/mimo-usage-dashboard/archive/refs/heads/main.tar.gz"] }
-```
-
-### Option C: one-line script (Windows)
+### Option A: one-liner script (Windows)
 
 ```powershell
-irm https://raw.githubusercontent.com/Martin-soaring-dev/mimo-usage-dashboard/main/install.ps1 | iex
-```
-
-It copies the dashboard into `~/.config/mimocode/usage-dashboard/`, registers
-`file://…/plugin/usage-dashboard.mjs` in the `plugin` array, and installs the skill (shown on the Plugins page).
-
-### Option D: manual clone + `file://`
-
-```bash
 git clone https://github.com/Martin-soaring-dev/mimo-usage-dashboard
+cd mimo-usage-dashboard
+powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Then add `file:///…/mimo-usage-dashboard/plugin/usage-dashboard.mjs` to the `plugin` array.
+It copies the CLI to `~/.config/mimocode/usage-dashboard/`, writes `command.usage` /
+`command.usage-open` into `mimocode.jsonc`, and cleans up leftovers from the old design.
 
-### Run the dashboard standalone
+Then **fully restart MiMo Desktop** and **open a new session**.
+
+### Option B: manual
+
+1. Put `usage_cli.py` and `register_command.py` anywhere (e.g. `D:\tools\mimo-usage\`).
+2. Run `python register_command.py`, or add a `command` block to
+   `~/.config/mimocode/mimocode.jsonc` yourself (see the Chinese README for the exact shape).
+
+> The shell directive inside the template is a **real instruction** — the engine will execute it.
+> Never put it in comments or examples.
+
+### Option C: just run it, no command registered
 
 ```bash
-node server.mjs --open   # requires Node.js >= 22 (uses built-in node:sqlite)
+python usage_cli.py --open          # Python ≥ 3.10, no third-party deps
 ```
 
-> **Why register a `.mjs` in the `plugin` array?** MiMo scans plugin dirs with `{plugin,plugins}/*.{ts,js}`,
-> which **excludes `.mjs`**; a `.mjs` must be registered via the `plugin` array with a `file://` URL, like the
-> app's own plugins.
+On Windows you can also **double-click `usage.cmd`**.
 
 ## Usage
 
-Inside MiMo Desktop:
-
-- Say **"show my usage / token consumption / usage stats"** → calls `usage_stats` and returns a Markdown summary in chat.
-- Say **"open the usage dashboard"** → calls `usage_dashboard`, starts the local server and opens it in your browser
-  (the URL also works in MiMo's built-in browser).
-- The "Usage Dashboard" skill appears on the **Plugins page**.
-
-Open the dashboard directly at `http://127.0.0.1:8790`.
-
-### Experimental: add “Usage” to the Desktop account menu
-
-MiMo Desktop has no public React/sidebar UI plugin API. This repository includes an **optional app.asar patch** that adds a “用量统计” item below “剩余用量” in the account menu and opens the full dashboard in a modal iframe. It backs up the original `app.asar` and `app.asar.unpacked` and includes a restore command. This is **not an officially supported extension point**.
-
-1. Clone this repository and run:
-
-   ```powershell
-   npm install
-   # Read-only installation inspection
-   npm run desktop:inspect
-   # Extract, inject, and repack in a temp directory only; does not alter the installed app
-   npm run desktop:dry-run
-   ```
-
-2. Run `install.ps1` to install the latest plugin file from this checkout (the plugin starts the local service on initialization), then fully quit MiMo Desktop, including its tray process:
-
-   ```powershell
-   .\install.ps1
-   ```
-
-3. In an **Administrator PowerShell** window, switch to the repository and run:
-
-   ```powershell
-   npm run desktop:patch
-   ```
-
-4. Restart MiMo Desktop, open the account menu at the lower left, and choose “用量统计”.
-
-To restore the original app, fully quit MiMo Desktop and run `npm run desktop:restore` in an Administrator PowerShell window.
-
-> **Risks and limitations**: App updates can overwrite this patch; rerun the patch after updating. It repacks the official app.asar and is intended for personal use only. If startup fails, quit the app and restore the backup. Do not distribute a modified app.asar.
-
-## Extensibility (read this before adding an "entry" / button)
-
-The MiMo **engine** is open source ([XiaomiMiMo/MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code), MIT), but the **desktop app is closed source**. The right-panel "+" menu and sidebar tabs are constants compiled into the bundle — only an app.asar patch can change them. What the plugin ecosystem *can* add: entries in the composer `/` menu (Command / Skill / MCP), inline `sci-widget` blocks in the chat, and artifacts / the built-in browser.
-
-Full interface inventory, code evidence, and three possible routes: [`docs/extensibility.md`](./docs/extensibility.md) (Chinese).
-
-## How it works
-
-```
-MiMo Desktop ──► mimocode.db ──► usage-core.mjs ──► server.mjs ──► dashboard.html
-                     ▲                                             (http://127.0.0.1:8790)
-                     └── plugin/usage-dashboard.mjs ── tools: usage_stats / usage_dashboard
-```
-
-- **Data layer** `usage-core.mjs`: opens `mimocode.db` read-only and aggregates (falls back to a temp snapshot if locked).
-- **Server** `server.mjs`: binds to `127.0.0.1` only; serves `/`, `/api/usage`, `/api/summary`, `/api/ping`.
-- **Plugin** `plugin/usage-dashboard.mjs`: registers two tools; locates its own dashboard files (npm install) or reads `usage-dashboard.config.json` (script install).
-- **Skill** `skill/`: tells the agent when to call the tools.
-
-## Metric definitions
-
-| Metric | Definition |
+| Input | Effect |
 |---|---|
-| **tokens** | input + output |
-| **input tokens** | `tokens.input` + `tokens.cache.read` |
-| **output tokens** | `tokens.output` + `tokens.reasoning` |
+| `/usage` | Overview page (Token + Session + Context) |
+| `/usage token` | Token usage only |
+| `/usage session` | Session detail only |
+| `/usage context` | Context occupancy only |
+| `/usage token --days 7` | Last 7 days |
+| `/usage-open` | Generate and open in the default browser |
+
+Output goes to the **current working directory**: `mimo-usage-<kind>-<date>.html`.
+
+### CLI
+
+```bash
+python usage_cli.py                     # overview
+python usage_cli.py token --days 7
+python usage_cli.py session
+python usage_cli.py context
+python usage_cli.py --open
+python usage_cli.py --out D:/x.html
+python usage_cli.py --db <path>
+python usage_cli.py --print-path
+```
+
+### Refresh
+
+The HTML is a **static snapshot** (the "regenerate" button just tells you to re-run the command;
+it makes no network requests). Re-run the same command to refresh.
+
+## Metrics
+
+| Metric | Formula |
+|---|---|
+| **tokens consumed** | input + output |
+| **input tokens** | `tokens.input + tokens.cache.read` |
+| **output tokens** | `tokens.output + tokens.reasoning` |
 | **cache hit rate** | `cache.read / (tokens.input + cache.read)` |
 | **sessions / requests / tools** | `session` rows / assistant messages / `part` rows with `type==="tool"` |
-| **edits** | `session.summary_additions + summary_deletions` (plus file count) |
+| **changes** | `session.summary_additions + summary_deletions` (plus file count) |
+| **context occupancy** | latest `step-finish` part's `tokens.total` (falls back to the latest assistant message) |
 
 Source: the `message` / `part` / `session` tables in `~/.local/share/mimocode/mimocode.db`.
 
-## Repository layout
-
-```
-index.mjs                   package entry (exports the plugin)
-package.json                npm manifest
-plugin/usage-dashboard.mjs  MiMoCode plugin (usage_stats / usage_dashboard)
-usage-core.mjs              data layer: read + aggregate the DB
-server.mjs                  local HTTP server (127.0.0.1 only)
-dashboard.html              dashboard page (hand-rolled SVG charts, no external deps)
-skill/                      skill (shown on the Plugins page)
-install.ps1 / register-plugin.mjs / start-dashboard.cmd
-test/smoke.mjs              smoke test
-.github/workflows/          CI and release
-docs/preview.svg            preview image
-docs/extensibility.md       extension-surface survey (plugin / MCP / command / sci-widget / artifacts)
-desktop-patch/              experimental app.asar patch (menu injection + restore)
-```
-
-## Development
-
-```bash
-npm install
-npm test          # syntax check + smoke test
-npm run server    # run the dashboard locally
-npm pack --dry-run
-npm run desktop:inspect # read-only inspection of the local MiMo asar
-npm run desktop:dry-run # patch/repack validation in a temporary directory
-```
-
-## Publishing (maintainers)
-
-Pushing a `v*` tag triggers `.github/workflows/release.yml`:
-
-```bash
-git tag v0.1.1
-git push origin v0.1.1
-```
-
-The workflow: runs tests → sets the version from the tag → `npm publish --provenance --access public` → creates a GitHub Release.
-Auth uses the repo secret `NPM_TOKEN` (an npm **granular token** with *Bypass two-factor authentication* checked,
-Permissions = `Read and write (publish and stage)`, Select packages = `All Packages`).
-
-> You can switch to npm **Trusted Publishing** (OIDC, no token): configure a Trusted Publisher on the npm package page
-> pointing at this repo + `release.yml`, then drop `NODE_AUTH_TOKEN` from the workflow.
-
 ## Security & privacy
 
-- The server binds to `127.0.0.1` only and **never uploads any data**.
-- The database is opened **read-only**; if it is locked, a temp snapshot is used — the DB is **never written**.
+- **No network**, no data upload, no listening port.
+- Database opened **read-only** (`mode=ro`); if locked, a temporary snapshot is copied and read — **never written**.
+- Command arguments are **allow-listed**: `$ARGUMENTS` is split and any token containing shell
+  metacharacters is dropped, preventing command injection. See `_sanitize_args` in `usage_cli.py`.
+
+## Layout
+
+```
+usage_cli.py                core: read-only db → aggregate → self-contained HTML (stdlib only)
+register_command.py         writes /usage and /usage-open into mimocode.jsonc (JSONC-aware)
+install.ps1                 Windows installer
+usage.cmd                   double-click to generate + open
+skill/usage/                /usage command docs
+skill/mimo-usage-dashboard/ dashboard explanation (docs only, executes nothing)
+docs/architecture.md        engine mechanics evidence (command table, shell substitution)
+docs/plugin-interface.md    MiMo plugin interface survey
+test/test_python.py         Python e2e tests (aggregation / views / injection guard / JSONC)
+test/command-e2e.mjs        Node side: simulates the engine's template + shell pipeline
+```
 
 ## Troubleshooting
 
-- **No `usage_stats` tool**: make sure the `plugin` array contains the entry, then **fully restart** MiMo Desktop.
-- **"service start timed out"**: you need system `node` >= 22, or set `MIMO_USAGE_NODE` to the full path of `node.exe`.
-- **Port in use**: use `--port` and update `port` in `usage-dashboard.config.json`.
-- **Data not changing**: the page auto-refreshes every 5 minutes; you can also click "刷新".
+- **`/usage` does nothing**: confirm `mimocode.jsonc` has `command.usage`, then **fully restart** MiMo Desktop and **open a new session** (the command table is built at session start).
+- **`MiMo database not found`**: make sure MiMo Desktop has run at least once; or pass `--db` / set `MIMO_USAGE_DB`.
+- **Python not found**: install Python ≥ 3.10, or run `install.ps1 -Python <path>`.
 
 ## Uninstall
 
-```powershell
-Remove-Item "$env:USERPROFILE\.config\mimocode\usage-dashboard" -Recurse -Force
-Remove-Item "$env:USERPROFILE\.config\mimocode\plugin\usage-dashboard.mjs" -Force
-Remove-Item "$env:USERPROFILE\.config\mimocode\skills\mimo-usage-dashboard" -Recurse -Force
-Remove-Item "$env:USERPROFILE\.config\mimocode\usage-dashboard.config.json" -Force
+```bash
+python register_command.py --uninstall
 ```
 
-Then remove the `usage-dashboard.mjs` entry from the `plugin` array (the script install backs it up as `mimocode.jsonc.bak-usage-dashboard`).
+Then delete `~/.config/mimocode/usage-dashboard/`.
 
 ## License
 
 MIT © Martin-soaring-dev
 
-> This is an **unofficial** third-party plugin, not affiliated with Xiaomi / MiMo.
+> Unofficial third-party tool. Not affiliated with Xiaomi / MiMo.

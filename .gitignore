@@ -5,3 +5,20 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 usage-dashboard.config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地调试临时产物
+.shots/
+.chrome-prof*/
+.*-out.txt
+.server.log
+.host.log
+
+# 生成的用量页面（脚本默认输出到工作目录）
+mimo-usage-*.html
+outputs/
