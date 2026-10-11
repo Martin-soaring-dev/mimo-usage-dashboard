@@ -3,9 +3,11 @@
 // 用法: node test/runtime-check.mjs
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-const py = fs.readFileSync(path.resolve("usage_cli.py"), "utf8");
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const py = fs.readFileSync(path.join(repoRoot, "usage_cli.py"), "utf8");
 const m = py.match(/_RUNTIME = """([\s\S]*?)"""/);
 if (!m) { console.error("  FAIL  未找到 _RUNTIME"); process.exit(1); }
 
