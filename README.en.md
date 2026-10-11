@@ -85,8 +85,6 @@ On Windows you can also **double-click `usage.cmd`**.
 
 | Input | Effect |
 |---|---|
-| Input | Effect |
-|---|---|
 | `/usage` | Overview (fixed safe command; suffix arguments are not parsed) |
 | `/usage-open` | Generate and open in the default browser |
 Output goes to the **current working directory**: `mimo-usage-<kind>-<date>.html`.
