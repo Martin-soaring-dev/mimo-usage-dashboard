@@ -16,11 +16,13 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { stripJsonc, buildUsageTemplate } from "./helpers.mjs";
 
 const PY = process.env.MIMO_USAGE_PY
-  || "C:/Users/Martin/.workbuddy/binaries/python/versions/3.13.12/python.exe";
-const SCRIPT = path.resolve("usage_cli.py");
+  || process.env.PYTHON
+  || "python";
+const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "usage_cli.py");
 
 let failures = 0;
 const check = (name, ok, extra = "") => {

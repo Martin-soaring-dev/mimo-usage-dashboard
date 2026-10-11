@@ -85,13 +85,10 @@ On Windows you can also **double-click `usage.cmd`**.
 
 | Input | Effect |
 |---|---|
-| `/usage` | Overview page (Token + Session + Context) |
-| `/usage token` | Token usage only |
-| `/usage session` | Session detail only |
-| `/usage context` | Context occupancy only |
-| `/usage token --days 7` | Last 7 days |
+| Input | Effect |
+|---|---|
+| `/usage` | Overview (fixed safe command; suffix arguments are not parsed) |
 | `/usage-open` | Generate and open in the default browser |
-
 Output goes to the **current working directory**: `mimo-usage-<kind>-<date>.html`.
 
 ### CLI
@@ -130,9 +127,7 @@ Source: the `message` / `part` / `session` tables in `~/.local/share/mimocode/mi
 
 - **No network**, no data upload, no listening port.
 - Database opened **read-only** (`mode=ro`); if locked, a temporary snapshot is copied and read — **never written**.
-- Command arguments are **allow-listed**: `$ARGUMENTS` is split and any token containing shell
-  metacharacters is dropped, preventing command injection. See `_sanitize_args` in `usage_cli.py`.
-
+- The registered command does not interpolate user input into shell text. Pass filters directly to the local CLI; database and output paths are validated.
 ## Layout
 
 ```

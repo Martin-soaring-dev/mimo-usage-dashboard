@@ -92,14 +92,11 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 }
 ```
 
-其中 shell 命令写作：`!` + 反引号包裹的 `python <路径>\usage_cli.py --arg-string '$ARGUMENTS'`。
+其中 shell 命令使用固定调用：`!` + 反引号包裹的 `python <路径>\\usage_cli.py`。不要把 `$ARGUMENTS` 插入 shell 命令。
 
-> **`$ARGUMENTS` 必须用单引号包裹**，别改成双引号或不加引号 ——
-> 引擎是先替换 `$ARGUMENTS`、再扫 shell 的，包裹方式直接决定安全性。
-> 三种写法的实测差异见 [docs/architecture.md §5.1](docs/architecture.md)。
+> **安全说明：** 引擎在 shell 解析前进行模板文本替换，任何引号都不能可靠保护未经转义的 `$ARGUMENTS`。注册命令不透传动态参数；需要筛选时直接运行 `usage_cli.py`。
 >
-> 注意：模板里的 shell 指令是**真指令**，引擎会执行它 —— 不要写进注释或示例里。
-> 也可以直接跑 `python register_command.py` 让它自动写入。
+> 注意：模板里的 shell 指令是真正执行的命令，不要把它写进注释或示例。也可以直接运行 `python register_command.py` 自动注册。
 
 ### 方式 C：只想直接看，不装命令
 
@@ -115,13 +112,10 @@ Windows 也可以直接**双击 `usage.cmd`**。
 
 | 输入 | 效果 |
 |---|---|
-| `/usage` | 生成总览页（Token + Session + 上下文三合一） |
-| `/usage token` | 只生成 Token 用量页 |
-| `/usage session` | 只生成 Session 用量页 |
-| `/usage context` | 只生成上下文占用页 |
-| `/usage token --days 7` | 最近 7 天 |
+| 输入 | 效果 |
+|---|---|
+| `/usage` | 生成总览页（固定安全命令，不解析后缀参数） |
 | `/usage-open` | 生成并用默认浏览器打开 |
-
 生成的文件默认落在**当前工作目录**：`mimo-usage-<kind>-<日期>.html`。
 
 ### 直接跑 CLI
@@ -160,9 +154,7 @@ HTML 是**静态快照**（页面上的「重新生成」按钮只是提示你�
 
 - **不联网**、不上传任何数据、不监听任何端口。
 - 数据库**仅只读**打开（`mode=ro`）；被占用时复制一份临时快照再读，**绝不写库**。
-- 命令参数走**白名单校验**：`$ARGUMENTS` 会被拆解并剔除任何含 shell 元字符的 token，
-  防止用户输入造成命令注入。详见 `usage_cli.py` 的 `_sanitize_args`。
-
+- 注册命令不把用户输入插入 shell 字符串。筛选参数请直接传给本地 CLI；数据库和输出路径会经过校验。
 ## 仓库结构
 
 ```
