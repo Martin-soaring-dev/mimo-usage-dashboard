@@ -156,6 +156,10 @@ def main() -> int:
     check("占用比例可算", ctx["context"]["ratio"] is not None)
 
     # ---- 3. 四种视图 HTML ----
+    all_html = U.render_html(U.card_data(db, kind="all"), cmd="python usage_cli.py")
+    check("总览页含三个可访问性 Tab", all(k in all_html for k in
+          ('总体使用量', '会话使用量', '上下文使用量', 'role="tablist"', 'role="tabpanel"')))
+    check("Tab 点击后渲染对应视图", 'renderTab(selected, DATA)' in all_html)
     print("\n=== 视图渲染 ===")
     for kind in ("all", "token", "session", "context"):
         d = U.card_data(db, kind=kind)
@@ -168,7 +172,9 @@ def main() -> int:
             check(f"{kind}: 含热力图渲染器", "function heatmapCard" in html)
             check(f"{kind}: 含模型调用块", "按模型的调用情况" in html)
             check(f"{kind}: 含缓存命中率", "缓存命中率" in html)
+            check(f"{kind}: 输入 tokens 卡片包含缓存读取", '输入 tokens（含缓存读取）' in html)
             check(f"{kind}: 模型块含命中率条", "track3" in html and "cm-hit-hit" in html)
+            check(f"{kind}: 未命中条不再负 margin 覆盖", "margin-left:-1.6%" not in html)
             # 热力图数据必须覆盖全量（不受 --days 限制）+ 顶部趋势用范围内数据
             check(f"{kind}: token 数据含 daily(热力图)", '"daily"' in html)
             check(f"{kind}: token 数据含 recent(趋势)", '"recent"' in html)

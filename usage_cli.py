@@ -536,6 +536,10 @@ body{background:var(--bg);color:var(--text);
 .btn{font:inherit;font-size:12px;color:var(--accent);background:var(--accent-soft);
   border:0;border-radius:999px;padding:6px 14px;cursor:pointer;text-decoration:none;display:inline-block}
 .btn:hover{filter:brightness(.96)}
+.tabs{display:flex;gap:6px;padding:5px;background:var(--panel2);border:1px solid var(--border);border-radius:12px;margin:0 0 14px;overflow-x:auto}
+.tab{flex:1;min-width:max-content;border:0;border-radius:8px;padding:9px 14px;background:transparent;color:var(--muted);font:inherit;font-weight:600;cursor:pointer}
+.tab[aria-selected="true"]{background:var(--panel);color:var(--accent);box-shadow:var(--shadow)}
+.tab:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .wrap{padding:0}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
@@ -743,8 +747,8 @@ function modelCard(t){
       '<div class="track2" title="token 总量占最高模型的比例"><i style="width:' + ((m.tokens/maxTok)*100).toFixed(1) + '%"></i></div>' +
       // 命中率条：浅蓝=命中(左)，橙=未命中(右)。命中率普遍很高，所以未命中段强制最小可见宽度。
       '<div class="track3" title="缓存命中 ' + pct(hit) + '（命中 ' + fmt(m.read) + ' / 未命中 ' + fmt(m.input) + '）">' +
-        '<i class="cm-hit-hit" style="width:' + cachePct.toFixed(2) + '%"></i>' +
-        (freshPct > 0 ? '<i class="cm-hit-miss" style="width:' + Math.max(freshPct, 1.6).toFixed(2) + '%;margin-left:-1.6%"></i>' : '') +
+        '<i class="cm-hit-hit" style="width:' + (freshPct > 0 ? 100 - Math.max(freshPct, 1.6) : 100).toFixed(2) + '%"></i>' +
+        (freshPct > 0 ? '<i class="cm-hit-miss" style="width:' + Math.max(freshPct, 1.6).toFixed(2) + '%"></i>' : '') +
       '</div>' +
       '<div class="msub" style="margin-top:4px">缓存命中 <b style="color:' + hitColor + '">' + pct(hit) + '</b>' +
         ' <span class="muted">（命中 ' + fmt(m.read) + ' / 新输入 ' + fmt(m.input) + '）</span></div>' +
@@ -766,7 +770,7 @@ function tokenCard(t){
   // 字段名与 Python card_data 的 totals 严格对应：input/output 为原始值，
   // 缓存在 cacheRead（不是 read —— 之前写错导致「缓存读取 0」）。
   var cards = [
-    ['输入 tokens', fmt(tot.input)],
+    ['输入 tokens（含缓存读取）', fmt((tot.input||0) + (tot.cacheRead||0))],
     ['输出 tokens', fmt((tot.output||0) + (tot.reasoning||0))],
     ['缓存读取', fmt(tot.cacheRead)],
     ['缓存命中率', pct(tot.cacheShare)],
@@ -868,13 +872,28 @@ function contextCard(c){
     '</div>';
 }
 
+function renderTab(kind, data){
+  if (kind === "token") return tokenCard(data.token || { totals:{}, models:[], daily:[], days:30 });
+  if (kind === "session") return sessionCard(data.session || { top: [] });
+  if (kind === "context") return contextCard(data.context);
+  return "";
+}
+
 function buildBody(data){
   var kind = data.kind || "all";
-  var body = "";
-  if (kind === "token" || kind === "all") body += tokenCard(data.token || { totals:{}, models:[], daily:[], days:30 });
-  if (kind === "session" || kind === "all") body += '<div style="height:12px"></div>' + sessionCard(data.session || { top: [] });
-  if (kind === "context" || kind === "all") body += '<div style="height:12px"></div>' + contextCard(data.context);
-  return body;
+  if (kind !== "all") return renderTab(kind, data);
+  var tabs = [
+    { id: "token", label: "总体使用量" },
+    { id: "session", label: "会话使用量" },
+    { id: "context", label: "上下文使用量" }
+  ];
+  var nav = '<div class="tabs" role="tablist" aria-label="用量视图">' + tabs.map(function(tab, i){
+    return '<button class="tab" type="button" role="tab" id="tab-' + tab.id +
+      '" aria-controls="tab-content" aria-selected="' + (i === 0 ? "true" : "false") +
+      '" data-tab="' + tab.id + '">' + tab.label + '</button>';
+  }).join("") + '</div>';
+  return nav + '<div id="tab-content" role="tabpanel" aria-labelledby="tab-token">' +
+    renderTab("token", data) + '</div>';
 }
 
 function footer(data){
@@ -926,7 +945,21 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "") -> str:
   var CMD = {json.dumps(cmd)};
   var OUT = {json.dumps(out_path)};
   {_RUNTIME}
-  document.getElementById("root").innerHTML = buildBody(DATA) + footer(DATA);
+  var root = document.getElementById("root");
+  root.innerHTML = buildBody(DATA) + footer(DATA);
+  root.addEventListener("click", function(ev){{
+    var btn = ev.target && ev.target.closest ? ev.target.closest("[data-tab]") : null;
+    if (!btn) return;
+    var selected = btn.getAttribute("data-tab");
+    root.querySelectorAll("[data-tab]").forEach(function(tab){{
+      tab.setAttribute("aria-selected", tab === btn ? "true" : "false");
+    }});
+    var panel = document.getElementById("tab-content");
+    if (panel) {{
+      panel.innerHTML = renderTab(selected, DATA);
+      panel.setAttribute("aria-labelledby", "tab-" + selected);
+    }}
+  }});
 
   document.getElementById("regen").addEventListener("click", function(){{
     var msg = "数据是静态快照，无法在页面内刷新。\\n\\n请重新运行这条命令：\\n" + CMD;

@@ -3,15 +3,27 @@
 // 用法: node test/runtime-check.mjs
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-const py = fs.readFileSync(path.resolve("usage_cli.py"), "utf8");
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const py = fs.readFileSync(path.join(repoRoot, "usage_cli.py"), "utf8");
 const m = py.match(/_RUNTIME = """([\s\S]*?)"""/);
 if (!m) { console.error("  FAIL  未找到 _RUNTIME"); process.exit(1); }
 
+const rootElement = {
+  clientWidth: 960,
+  innerHTML: "",
+  addEventListener() {},
+  querySelectorAll() { return []; },
+};
+const panelElement = {
+  innerHTML: "",
+  setAttribute() {},
+};
 const sandbox = {
   document: {
-    getElementById: () => ({ clientWidth: 960, innerHTML: "" }),
+    getElementById: (id) => id === "tab-content" ? panelElement : rootElement,
     createElement: () => ({ style: {}, appendChild() {}, classList: { add() {} } }),
   },
   navigator: {},
@@ -46,6 +58,10 @@ for (const [name, data] of cases) {
     if (name !== "空数据 all") {
       check(`buildBody(${name}) 含热力图`, out.includes("Token 热力图"));
       check(`buildBody(${name}) 含模型块`, out.includes("按模型的调用情况"));
+      if (name === "all") {
+        check("all 页包含三种 Tab", out.includes("总体使用量") && out.includes("会话使用量") && out.includes("上下文使用量"));
+        check("all 页初始展示总体使用量", out.includes('aria-selected="true"') && out.includes('aria-labelledby="tab-token"'));
+      }
     }
   } catch (e) {
     check(`buildBody(${name})`, false, e.message);
