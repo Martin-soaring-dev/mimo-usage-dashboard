@@ -48,7 +48,7 @@
     "usage:context": "python usage_cli.py context",
     "register": "python register_command.py",
     "unregister": "python register_command.py --uninstall",
-    "test": "python test/test_python.py && node test/runtime-check.mjs",
+    "test": "python test/test_python.py && node test/runtime-check.mjs && node test/command-e2e.mjs",
     "test:node": "node test/command-e2e.mjs",
     "test:runtime": "node test/runtime-check.mjs",
     "test:live": "python test/e2e_live.py",
