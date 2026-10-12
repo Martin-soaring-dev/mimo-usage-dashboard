@@ -317,6 +317,57 @@ def read_usage(db_path: str) -> dict:
 # 聚合：单会话上下文占用
 # ---------------------------------------------------------------------------
 
+# 上下文用量分类树：只把**数据库里真实存在、可逐项核对**的字段拆成分支。
+# 每个分支声明自己的单位（tokens / 次 / 条），不同单位绝不混算。
+_TOKENS_BRANCH_FIELDS = (
+    ("缓存读取", "read"), ("新输入", "input"), ("推理", "reasoning"),
+    ("输出", "output"), ("缓存写入", "write"),
+)
+
+# MiMo 数据库只保存每次请求聚合后的 tokens 五项，不保存提示词各段落的拆分，
+# 因此下面这些分类在本地只读条件下无法还原，必须如实标注为「无法细分」而不是猜。
+_CONTEXT_NOT_SUBDIVIDABLE = (
+    "系统提示词", "内置工具清单", "Memory 文件", "Skills", "启动上下文",
+)
+_CONTEXT_NOT_SUBDIVIDABLE_REASON = (
+    "数据库只存每次请求聚合后的 tokens（total/input/output/reasoning/cache），"
+    "不存提示词各段落各自的 token 数，因此无法在本地只读条件下还原这部分拆分。"
+)
+
+
+def _branch(label: str, unit: str, note: str, total: int, fields: list) -> dict:
+    """构造分类树的一个分支节点。
+
+    ``fields`` 是 ``[(子项名, 数值), …]``，按调用方给定的顺序保留（不做隐含重排）。
+    子项之和与 ``total`` 的差额单列一项，不做任何猜测性归并：
+      * 差额 > 0 → 「未分类」（有总量但无对应字段）
+      * 差额 < 0 → 「字段和超出总量」（原始数据异常，如实标记而不是强行归零）
+    """
+    children = [{"label": str(k), "value": int(v or 0)} for k, v in fields]
+    gap = int(total or 0) - sum(c["value"] for c in children)
+    if gap > 0:
+        children.append({"label": "未分类", "value": gap})
+    elif gap < 0:
+        children.append({"label": "字段和超出总量", "value": -gap})
+    return {"label": label, "unit": unit, "note": note,
+            "total": int(total or 0), "children": children}
+
+
+def _counted(values, unknown: str) -> list:
+    """把一串类别名聚合成长度去重、按次数降序（同次数按名称升序）的 ``[(名, 次), …]``。
+
+    只有**非空字符串**才算一个已知类别；其余（None、空串、纯空白、数字、布尔、字典…）
+    一律归入 ``unknown``（例如「未知工具」）并计数，既不丢弃也不猜测其含义。
+    同名的多次出现会合并成一项，不会产生重复类别。
+    """
+    counts: dict[str, int] = {}
+    for v in values:
+        key = v.strip() if isinstance(v, str) else ""
+        if not key:
+            key = unknown
+        counts[key] = counts.get(key, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
 
 def session_context(db_path: str, session_id: str | None = None, limit: int | None = None) -> dict:
     if not os.path.exists(db_path):
@@ -374,6 +425,8 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
         tools = 0
         steps = 0
         last_step_tokens = None
+        part_types: list = []
+        tool_names: list = []
         for r in conn.execute(
             "SELECT time_created, data FROM part WHERE session_id=? ORDER BY time_created ASC",
             (sid,),
@@ -381,8 +434,11 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
             d = _loads(r[1])
             if not isinstance(d, dict):
                 continue
+            ptype = d.get("type")
+            part_types.append(ptype if isinstance(ptype, str) else "")
             if d.get("type") == "tool":
                 tools += 1
+                tool_names.append(d.get("tool"))
             elif d.get("type") == "step-finish":
                 steps += 1
                 t = d.get("tokens")
@@ -406,6 +462,34 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
                 "write": int(cache.get("write") or 0),
             }
 
+        # ---- 上下文用量分类树 ----
+        # 三个 tokens 口径分支 + 两个计数口径分支。每个分支的合计都能与原始总量逐项核对：
+        #   current  → context.used（最新一次 step-finish / assistant 消息的 total）
+        #   lifetime → tokens.total（本会话全部 assistant 消息之和）
+        #   tools    → context.tools（part.type=tool 的条数）
+        #   parts    → 该会话 part 表行数（工具调用是它的真子集，单位不同，不混算）
+        src = "step-finish" if last_step_tokens else ("message" if last_msg_tokens else "none")
+        snap_total = int((detail or {}).get("total") or 0)
+
+        def _tok_fields(src_dict) -> list:
+            d = src_dict if isinstance(src_dict, dict) else {}
+            return [(label, int(d.get(key) or 0)) for label, key in _TOKENS_BRANCH_FIELDS]
+
+        branches = [
+            _branch("当前上下文快照", "tokens",
+                    f"单位 tokens；来源 {src}（最新一次请求的 token 明细）",
+                    snap_total, _tok_fields(detail)),
+            _branch("本会话累计", "tokens",
+                    "单位 tokens；该会话全部 assistant 消息之和（历史累计，不是当前上下文）",
+                    agg["total"], _tok_fields(agg)),
+            _branch("工具调用", "次",
+                    "单位 次；part.type=tool 的条数（与 tokens 口径无关，不能相加）",
+                    tools, _counted(tool_names, "未知工具")),
+            _branch("消息片段构成", "条",
+                    "单位 条；该会话 part 表全部行的 type 分布（工具调用是它的子集）",
+                    len(part_types), _counted(part_types, "未知类型")),
+        ]
+
         return {
             "ok": True,
             "sessionId": sid,
@@ -422,8 +506,17 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
                 "used": used,
                 "limit": resolved_limit,
                 "ratio": (used / resolved_limit) if resolved_limit else None,
-                "source": "step-finish" if last_step_tokens else ("message" if last_msg_tokens else "none"),
+                "source": src,
                 "detail": detail,
+            },
+            "breakdown": {
+                "root": "上下文用量分类",
+                "rootUnit": "按可核对字段拆分，不同单位分别标注",
+                "branches": branches,
+                "notSubdividable": {
+                    "labels": list(_CONTEXT_NOT_SUBDIVIDABLE),
+                    "reason": _CONTEXT_NOT_SUBDIVIDABLE_REASON,
+                },
             },
             "watermark": srow[8], "compacting": srow[9], "lastCheckpoint": srow[10],
         }
@@ -439,6 +532,67 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
 # ---------------------------------------------------------------------------
 
 
+def _window_slice(data: dict, days: int) -> dict:
+    """把全量聚合裁剪成某个「自然日窗口」的 token 视图数据。
+
+    窗口口径：[今天 -(days-1) 天 的本地 00:00, 现在]，按本地日期切分（自然日）。
+    所以 ``days=1`` 就是「今日」——从当天 00:00 起，不是滚动的最近 24 小时。
+
+    这些切片在**生成时一次算好并内联进 HTML**，浏览器端切换时间尺度只是换一份已经
+    存在的数字，不重新读库、不发请求（C1/C2/C4）。
+    """
+    days = days if (isinstance(days, int) and days > 0) else 30
+    from_date = _local_date(int((datetime.now() - timedelta(days=days - 1)).timestamp() * 1000))
+    recent = [d for d in data["daily"] if d["date"] >= from_date]
+
+    sum_ = {"tokens": 0, "input": 0, "output": 0, "reasoning": 0,
+            "read": 0, "write": 0, "requests": 0, "tools": 0}
+    for d in recent:
+        for k in sum_:
+            sum_[k] += d[k]
+
+    mlist = []
+    for m in data["models"]:
+        t = sum(v for k, v in m["daily"].items() if k >= from_date)
+        if t <= 0:
+            continue
+        mlist.append({
+            "name": m["name"], "providerID": m["providerID"], "tokens": t,
+            "read": sum(v for k, v in (m.get("dailyRead") or {}).items() if k >= from_date),
+            "input": sum(v for k, v in (m.get("dailyInput") or {}).items() if k >= from_date),
+            "requests": sum(v for k, v in (m.get("dailyReq") or {}).items() if k >= from_date),
+            "tools": sum(v for k, v in (m.get("dailyTools") or {}).items() if k >= from_date),
+        })
+    mlist.sort(key=lambda m: m["tokens"], reverse=True)
+
+    denom = sum_["input"] + sum_["read"]
+    # share = 该模型 token / 窗口内**全部**模型 token。分母是截断前的总和，
+    # 所以模型数 > 8 时这些 share 之和会 < 1（这是正确语义，不是舍入误差）。
+    model_total_tokens = sum(m["tokens"] for m in mlist)
+    return {
+        "days": days,
+        "fromDate": from_date,
+        # 显式给出分母与模型总数，前端与测试都不必猜 share 的口径。
+        "modelTotal": model_total_tokens,
+        "modelCount": len(mlist),
+        "totals": {
+            # 注意字段语义：input/output 是**原始值**（不含缓存），cacheRead 单列；
+            # JS 端 tokenCard 按同名取用。
+            "tokens": sum_["tokens"],
+            "input": sum_["input"], "output": sum_["output"],
+            "reasoning": sum_["reasoning"],
+            "cacheRead": sum_["read"], "cacheWrite": sum_["write"],
+            "requests": sum_["requests"], "tools": sum_["tools"],
+            "cacheShare": (sum_["read"] / denom) if denom > 0 else 0.0,
+            # 会话数是全量会话行数（不受窗口影响），与 Session 视图的「会话总数」同源，
+            # 这样 Token 视图的「会话数」与 Session 视图的「会话总数」不会漂移。
+            "sessions": len(data["sessions"]),
+        },
+        "models": [{**m, "share": m["tokens"] / (model_total_tokens or 1)} for m in mlist[:8]],
+        "recent": [{"date": d["date"], "tokens": d["tokens"]} for d in recent],
+    }
+
+
 def card_data(db_path: str, kind: str = "all", days: int = 30,
               session_id: str | None = None, limit: int | None = None) -> dict:
     kind = kind if kind in KINDS else "all"
@@ -447,50 +601,21 @@ def card_data(db_path: str, kind: str = "all", days: int = 30,
     out = {"kind": kind, "generatedAt": int(datetime.now().timestamp() * 1000), "dbPath": db_path}
 
     if kind in ("token", "all"):
-        from_date = _local_date(int((datetime.now() - timedelta(days=days - 1)).timestamp() * 1000))
-        daily = [d for d in data["daily"] if d["date"] >= from_date]
-        sum_ = {"tokens": 0, "input": 0, "output": 0, "reasoning": 0,
-                "read": 0, "write": 0, "requests": 0, "tools": 0}
-        for d in daily:
-            for k in ("tokens", "input", "output", "reasoning", "read", "write", "requests", "tools"):
-                sum_[k] += d[k]
-        inp = sum_["input"] + sum_["read"]
-        out_tok = sum_["output"] + sum_["reasoning"]
-        mlist = []
-        for m in data["models"]:
-            t = sum(v for k, v in m["daily"].items() if k >= from_date)
-            if t <= 0:
-                continue
-            rd = sum(v for k, v in (m.get("dailyRead") or {}).items() if k >= from_date)
-            ix = sum(v for k, v in (m.get("dailyInput") or {}).items() if k >= from_date)
-            rq = sum(v for k, v in (m.get("dailyReq") or {}).items() if k >= from_date)
-            tl = sum(v for k, v in (m.get("dailyTools") or {}).items() if k >= from_date)
-            mlist.append({"name": m["name"], "providerID": m["providerID"],
-                          "tokens": t, "read": rd, "input": ix,
-                          "requests": rq, "tools": tl})
-        mlist.sort(key=lambda m: m["tokens"], reverse=True)
-        total_model = sum(m["tokens"] for m in mlist) or 1
+        # 时间尺度选项固定为「今日 / 7 天 / 30 天」；--days 不是这三者时再补一个自定义窗口，
+        # 保证 --days 的语义不被悄悄改掉。
+        win_days = sorted({1, 7, 30, days})
+        # 顶层字段保持原样：与 --days 对应的那一份（回归基线）。
         out["token"] = {
-            "days": days,
-            "totals": {
-                # 注意字段语义：input/output 是**原始值**（不含缓存），
-                # cacheRead 单列；JS 端 tokenCard 按同名取用。
-                "tokens": sum_["tokens"],
-                "input": sum_["input"], "output": sum_["output"],
-                "reasoning": sum_["reasoning"],
-                "cacheRead": sum_["read"], "cacheWrite": sum_["write"],
-                "requests": sum_["requests"], "tools": sum_["tools"],
-                "cacheShare": (sum_["read"] / inp) if inp > 0 else 0.0,
-                # 与 session.total 用同一表达式：会话数是全量会话行数（不受 --days 影响），
-                # 这样 Token 视图的「会话数」与 Session 视图的「会话总数」不会漂移。
-                "sessions": len(data["sessions"]),
-            },
+            **_window_slice(data, days),
             "totalsAll": data["totals"],
-            "models": [{**m, "share": m["tokens"] / total_model} for m in mlist[:8]],
-            # 热力图覆盖最近 12 个月，不受 --days 影响
-            "daily": [{"date": d["date"], "tokens": d["tokens"]} for d in data["daily"]],
-            # 顶部迷你趋势仍按 --days 范围
-            "recent": [{"date": d["date"], "tokens": d["tokens"]} for d in daily],
+            # 热力图覆盖最近 12 个月，不受 --days 影响。这里把当日的 read/input/requests
+            # 一并带上，供热力图悬浮提示计算「当日缓存命中率」。
+            "daily": [{"date": d["date"], "tokens": d["tokens"], "read": d["read"],
+                       "input": d["input"], "requests": d["requests"]} for d in data["daily"]],
+            # 时间尺度切换用：今日 / 7 天 / 30 天（外加 --days 不是这三者时的自定义窗口）。
+            # 全在生成时算好并内联，浏览器端切换不读库、不发请求、不重新生成 HTML。
+            "windowKeys": [str(d) for d in win_days],
+            "windows": {str(d): _window_slice(data, d) for d in win_days},
         }
 
     if kind in ("session", "all"):
@@ -558,47 +683,41 @@ body{background:var(--bg);color:var(--text);
 h3{font-size:12px;margin:0 0 10px;font-weight:650;color:var(--muted);letter-spacing:.35px}
 .bar{height:10px;border-radius:6px;background:var(--track);overflow:hidden;display:flex}
 .bar i{display:block;height:100%}
-/* 缓存命中率分层（仅模型行使用）：命中=浅蓝（大面积），未命中=橙色（警示）
-   早期用 opacity 区分，在浅色卡片上会淡到不可见；这里改用实色。 */
-.cm-hit-hit{background:#8fb0fb}   /* 命中：浅蓝 */
-.cm-hit-miss{background:#f59e0b}  /* 未命中（新输入）：橙，警示 */
-/* 上下文构成用独立配色（语义与命中率不同，不复用上面的类） */
+/* 上下文构成用独立配色（模型份额条的浅色段语义不同，不复用这里的类） */
 .ctx-cache{background:#8fb0fb}  /* 缓存读取 */
 .ctx-input{background:#3b6ef6}   /* 新输入 */
 .ctx-reason{background:#a78bfa}  /* 推理 */
 .ctx-output{background:#34d399}  /* 输出 */
 .mrow{display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:center;padding:11px 0;border-bottom:1px solid var(--border)}
 .mrow:last-child{border-bottom:0}
+.mmain{min-width:0}
 .mname{font-weight:600;font-size:13px}
 .msub{color:var(--muted);font-size:11px;margin-top:3px}
 .mval{font-weight:700;color:var(--accent);font-size:13px;align-self:start;padding-top:1px}
-/* 模型行：份额条（单色）+ 命中率条（分层），两条独立，避免语义混淆 */
-.track2{height:6px;border-radius:4px;background:var(--track);overflow:hidden;margin-top:7px}
-.track2>i{display:block;height:100%;background:var(--accent);border-radius:4px}
-.track3{height:6px;border-radius:4px;background:var(--track);overflow:hidden;margin-top:4px;display:flex}
-.track3>i{display:block;height:100%;flex:0 0 auto;min-width:0}
-.track3>i.cm-hit-hit{border-radius:4px 0 0 4px}   /* 命中段在左 */
-.track3>i.cm-hit-miss{border-radius:0 4px 4px 0}  /* 未命中段在右 */
-.track3>i:only-child{border-radius:4px}
+.rank{display:inline-block;min-width:16px;margin-right:6px;padding:0 4px;border-radius:5px;
+  background:var(--accent-soft);color:var(--accent);font-size:10px;font-weight:700;text-align:center}
+/* 每个模型**只有一条**进度条：
+   条长 = 该模型 token / 窗口内全部模型 token（= m.share，右对齐百分比就是它）；
+   条内浅色段 = 该模型的缓存读取 token，与条长同分母（窗口内全部模型 token），可直接相加。 */
+.track{height:6px;border-radius:4px;background:var(--track);overflow:hidden;margin-top:7px}
+.track>.tf{display:block;height:100%;background:var(--accent);border-radius:4px;overflow:hidden}
+.track>.tf>.tc{display:block;height:100%;background:#8fb0fb;border-radius:4px 0 0 4px}
 .legend{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:11px;margin-bottom:8px;flex-wrap:wrap}
 .dot{width:9px;height:9px;border-radius:3px;display:inline-block}
 /* ---- 日历热力图 ----
-   格子用 aspect-ratio 保持正方形；列数由 grid 均分铺满卡片宽度。
-   --cell 只用来对齐左侧星期标签的行高。 */
-.hm{display:flex;gap:8px;align-items:flex-start;padding:2px 0 0}
-.hm .dow{display:flex;flex-direction:column;gap:var(--gap);flex:none;
-  color:var(--muted);font-size:9px;padding-top:22px;width:12px}
-.hm .dow span{line-height:var(--cell);display:block}
-.hm .cols{flex:1;min-width:0;overflow-x:auto;overflow-y:hidden;padding-bottom:2px}
-/* 窄屏时保持最小格子宽度，改为横向滚动，而不是把格子压成细条 */
-.hm .grid,.hm .months-grid{min-width:var(--minw,560px)}
-.hm .months-grid{display:grid;gap:var(--gap);color:var(--muted);font-size:9.5px;
-  margin-bottom:4px;line-height:14px}
-.hm .months-grid div{white-space:nowrap;overflow:hidden}
-.hm .grid{display:grid;gap:var(--gap);aspect-ratio:auto}
-.hm .col{display:flex;flex-direction:column;gap:var(--gap)}
-.hm .cell{width:100%;aspect-ratio:1/1;border-radius:3px;background:var(--track);
-  transition:transform .08s ease;max-height:20px}
+   星期标签和日期格在**同一个 CSS Grid** 里：标签占第 1 列、落在与对应日期行相同的
+   网格行上，行高由该行的格子决定。这样两者的中心必然重合，不依赖任何 padding-top /
+   line-height 补偿，也不会随窗口宽度漂移（UI-2）。
+   格子由列宽驱动（aspect-ratio:1/1），所以 12 个月在常规宽度下自动压缩铺满，
+   只有视口 <720px 时才由媒体查询给出最小宽度并允许横向滚动（UI-1）。 */
+.hm{margin:2px 0 0}
+.hm .cols{overflow-x:auto;overflow-y:hidden}
+.hm .hm-grid{display:grid;gap:var(--gap);min-width:0}
+.hm .mcell{grid-row:1;white-space:nowrap;overflow:hidden;color:var(--muted);font-size:9.5px;line-height:14px}
+.hm .dlbl{grid-column:1;align-self:center;justify-self:center;color:var(--muted);
+  font-size:9px;line-height:1}
+.hm .cell{width:100%;aspect-ratio:1/1;align-self:center;border-radius:3px;background:var(--track);
+  transition:transform .08s ease}
 .hm .cell:hover{transform:scale(1.35);outline:1px solid var(--accent);outline-offset:1px;position:relative;z-index:2}
 .hm .cell[data-lv="1"]{background:#dbe6fe}
 .hm .cell[data-lv="2"]{background:#a8c2fb}
@@ -606,6 +725,11 @@ h3{font-size:12px;margin:0 0 10px;font-weight:650;color:var(--muted);letter-spac
 .hm .cell[data-lv="4"]{background:#2f57d6}
 .hm .legend{margin:10px 0 0;justify-content:flex-end;gap:4px}
 .hm .legend i{width:11px;height:11px;border-radius:3px;display:inline-block}
+/* 悬浮提示层：position:fixed 自绘，读格子的 data-tip，贴近视口边缘时自动翻转/夹紧 */
+.hm-tip{position:fixed;z-index:99;padding:7px 10px;border-radius:8px;max-width:320px;
+  background:rgba(31,35,41,.94);color:#fff;font-size:11.5px;line-height:1.5;
+  pointer-events:none;white-space:nowrap;box-shadow:0 4px 14px rgba(16,24,40,.22)}
+.hm-tip[hidden]{display:none}
 .ctx-ring{display:flex;align-items:center;gap:18px}
 .ring{width:110px;height:110px;flex:none}
 .stat-line{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px dashed var(--border);font-size:12.5px}
@@ -624,25 +748,57 @@ td.tt{max-width:260px;overflow:hidden;text-overflow:ellipsis}
 .err{margin:0 0 16px;padding:14px 16px;border-radius:12px;background:#fff2f0;border:1px solid #ffccc7;color:#a8071a;font-size:12.5px}
 .pill{display:inline-block;padding:1px 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:10.5px;font-weight:600}
 .tip{background:var(--panel2);border:1px dashed var(--border);border-radius:10px;padding:11px 14px;color:var(--muted);font-size:11.5px;margin-bottom:16px}
+/* ---- 时间尺度分段控件（今日 / 7 天 / 30 天）---- */
+.tscale{display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap}
+.seg{display:inline-flex;gap:4px;padding:4px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;flex:none}
+.seg button{font:inherit;font-size:12px;font-weight:600;color:var(--muted);background:transparent;
+  border:0;border-radius:7px;padding:6px 13px;cursor:pointer;min-width:max-content}
+.seg button[aria-pressed="true"]{background:var(--panel);color:var(--accent);box-shadow:var(--shadow)}
+.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.scope{color:var(--muted);font-size:11px;flex:1 1 300px;min-width:0}
+/* ---- 上下文用量分类树 ----
+   分支节点是 role=treeitem 的按钮（tabindex=0），Enter/Space/←/→ 均可展开折叠（见 wireTree）。 */
+.tree{margin:2px 0 0}
+.trow{display:grid;grid-template-columns:13px minmax(0,1fr) auto auto;gap:2px 8px;align-items:center;
+  padding:6px;border-radius:8px;font-size:12.5px}
+.trow[data-tree-toggle]{cursor:pointer}
+.trow[data-tree-toggle]:hover{background:var(--panel2)}
+.trow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.trow .tw{color:var(--muted);font-size:10px;line-height:1;justify-self:center}
+.trow .tl{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trow .tu{justify-self:end}
+.trow .tv{justify-self:end;font-weight:650;font-variant-numeric:tabular-nums;min-width:74px;text-align:right}
+.tkids{margin:0 0 4px 13px;border-left:1px dashed var(--border);padding-left:8px}
+.tkids[hidden]{display:none}
+.tchild{color:var(--text)}
+.tdisc{color:var(--muted);font-size:11px;line-height:1.65;margin-top:10px;padding-top:9px;border-top:1px dashed var(--border)}
 @media(max-width:720px){
   .grid4{grid-template-columns:repeat(2,1fr)}
   .grid2{grid-template-columns:1fr}
   .page{padding:16px 12px 40px}
   .big{font-size:32px}
   .mrow{gap:2px 8px}
+  .trow{grid-template-columns:13px minmax(0,1fr) auto auto;font-size:12px}
+}
+/* 只有视口 <720px 才允许热力图横向滚动；≥720px 一律自适应铺满 12 个月，不出横向滚动条。 */
+@media(max-width:719.98px){
+  .hm .hm-grid{min-width:var(--minw,560px)}
 }
 """
 
 _RUNTIME = """
+// 缺失字段 / NaN / Infinity 一律当 0：旧版 payload 少字段时不能让 NaN 渲染进页面。
+var num = function(n){ var v = Number(n); return isFinite(v) ? v : 0; };
 var fmt = function(n){
-  n = Number(n) || 0;
+  n = num(n);
+  if (n >= 1e12) return (n/1e12).toFixed(2) + "T";
   if (n >= 1e9) return (n/1e9).toFixed(2) + "B";
   if (n >= 1e6) return (n/1e6).toFixed(1) + "M";
   if (n >= 1e3) return (n/1e3).toFixed(1) + "K";
   return String(Math.round(n));
 };
-var fmtInt = function(n){ return Number(n||0).toLocaleString("en-US"); };
-var pct = function(x){ return (isFinite(x) ? (x*100).toFixed(1) : "0.0") + "%"; };
+var fmtInt = function(n){ return num(n).toLocaleString("en-US"); };
+var pct = function(x){ x = Number(x); return (isFinite(x) ? (x*100).toFixed(1) : "0.0") + "%"; };
 var esc = function(s){ return String(s==null?"":s).replace(/[&<>"]/g, function(c){
   return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); };
 var timeCN = function(ms){ try { return new Date(ms).toLocaleString("zh-CN",{hour12:false}); } catch(e){ return "-"; } };
@@ -652,15 +808,58 @@ var ds = function(d){
   var m = d.getMonth()+1, day = d.getDate();
   return d.getFullYear() + "-" + (m<10?"0":"") + m + "-" + (day<10?"0":"") + day;
 };
+var DOW_CN = ["周日","周一","周二","周三","周四","周五","周六"];
+// "YYYY-MM-DD" → 本地 00:00 的 Date。不能写 new Date("YYYY-MM-DD")：那按 UTC 解析，
+// 负时区会整体差一天，星期也会错。
+var parseDay = function(key){
+  var p = String(key == null ? "" : key).split("-");
+  if (p.length !== 3) return null;
+  var y = Number(p[0]), m = Number(p[1]), d = Number(p[2]);
+  if (!isFinite(y) || !isFinite(m) || !isFinite(d)) return null;
+  var dt = new Date(y, m - 1, d);
+  return isNaN(dt.getTime()) ? null : dt;
+};
+var dowOf = function(key){
+  var dt = parseDay(key);
+  return dt ? DOW_CN[dt.getDay()] : "星期未知";
+};
+// 当日缓存命中率 = 缓存读取 / (缓存读取 + 新输入)。
+// 旧版 payload 的 daily 只有 {date, tokens}，缺 read/input 时返回 null（显示「—」），不猜测。
+var dayHit = function(rec){
+  if (!rec || typeof rec !== "object") return null;
+  var rd = Number(rec.read), ix = Number(rec.input);
+  if (!isFinite(rd) || !isFinite(ix)) return null;
+  var denom = rd + ix;
+  return denom > 0 ? rd / denom : null;
+};
+var optPct = function(x){ return x == null ? "—" : pct(x); };
+// 热力图格子的悬浮文案：日期 + 星期 + token 用量 + 缓存命中率（有数据时再补明细）。
+var hmTip = function(rec, key){
+  var v = rec ? num(rec.tokens) : 0;
+  var out = [String(key == null ? "" : key) + " " + dowOf(key),
+             v > 0 ? fmt(v) + " tokens" : "无调用",
+             "缓存命中率 " + optPct(dayHit(rec))];
+  if (rec && v > 0){
+    var rd = Number(rec.read), ix = Number(rec.input);
+    if (isFinite(rd) || isFinite(ix))
+      out.push("缓存读取 " + fmt(isFinite(rd)?rd:0) + " / 新输入 " + fmt(isFinite(ix)?ix:0));
+    if (isFinite(Number(rec.requests))) out.push("请求 " + fmtInt(rec.requests) + " 次");
+  }
+  return out.join(" · ");
+};
 
 // 12 个月日历热力图（GitHub 风格）。daily 只覆盖有数据的日子，其余补 0。
+// 星期标签与日期格共用同一个 CSS Grid（第 1 列放标签），所以标签行中心与对应日期行中心
+// 由布局本身保证重合，不靠 padding-top / line-height 补偿（UI-2）。
 function heatmapCard(t){
+  t = t || {};
   var daily = t.daily || [];
   var map = {};
-  daily.forEach(function(d){ map[d.date] = d; });
+  daily.forEach(function(d){ if (d && d.date) map[d.date] = d; });
 
   // 分位数分档（只对 >0 的值取分位，避免大量 0 拉低阈值）
-  var vals = daily.map(function(d){ return d.tokens; }).filter(function(v){ return v > 0; })
+  var vals = daily.map(function(d){ return num(d && d.tokens); })
+                  .filter(function(v){ return v > 0; })
                   .sort(function(a,b){ return a-b; });
   var q = function(p){ return vals.length ? vals[Math.min(vals.length-1, Math.floor(vals.length*p))] : 0; };
   var t1 = q(0.25), t2 = q(0.5), t3 = q(0.75);
@@ -685,122 +884,267 @@ function heatmapCard(t){
 
   var gap = 3;
   var lastMonth = -1;
-  var monthLabels = [];   // { col, text } —— 标签从该列开始
-  var cols = weeks.map(function(wk, ci){
+  var monthLabels = [];   // { col, text }；col 是 grid 列号（第 1 列留给星期标签）
+  var cells = [];
+  weeks.forEach(function(wk, ci){
     var m = wk[wk.length-1].getMonth();
-    if (m !== lastMonth){ lastMonth = m; monthLabels.push({ col: ci + 1, text: (m+1) + '月' }); }
-    var cells = wk.map(function(day){
+    if (m !== lastMonth){ lastMonth = m; monthLabels.push({ col: ci + 2, text: (m+1) + "月" }); }
+    wk.forEach(function(day, ri){
       var key = ds(day);
-      var o = map[key];
-      var v = o ? o.tokens : 0;
-      var tip = key + ' · ' + (v ? fmt(v) + ' tokens' : '无调用');
-      return '<div class="cell" data-lv="' + level(v) + '" data-tip="' + tip + '"></div>';
-    }).join("");
-    return { c: cells };
+      var rec = map[key];
+      var tip = hmTip(rec, key);
+      cells.push('<div class="cell" role="img" data-date="' + key + '" data-row="' + ri +
+        '" data-lv="' + level(rec ? num(rec.tokens) : 0) + '" aria-label="' + esc(tip) +
+        '" data-tip="' + esc(tip) + '" style="grid-column:' + (ci + 2) +
+        ';grid-row:' + (ri + 2) + '"></div>');
+    });
   });
-  var nc = cols.length;
-  // 格子宽高一致（CSS aspect-ratio）；这里只给左侧星期标签一个对齐用的行高。
-  var cell = nc > 56 ? 12 : nc > 48 ? 13 : 15;
+  var nc = weeks.length;
+  // 格子尺寸由列宽驱动；这个下限只在 <720px 的横向滚动模式下生效。
+  var cellMin = nc > 56 ? 12 : nc > 48 ? 13 : 15;
 
-  var dow = ["", "一", "", "三", "", "五", ""].map(function(x){ return '<span>' + x + '</span>'; }).join("");
-  // 月份标签用 grid-column 精确定位到对应列（避免文字宽度撑破单列）
-  var months = monthLabels.map(function(l){
-    return '<div style="grid-column:' + l.col + ' / span 3">' + l.text + '</div>';
+  // 周一/三/五 → 星期序号 1/3/5 → 日期行 ri 对应 grid-row ri+2（第 1 行是月份行）。
+  var dow = [[1,"一"],[3,"三"],[5,"五"]].map(function(p){
+    return '<div class="dlbl" aria-hidden="true" data-dow="' + p[0] +
+      '" style="grid-row:' + (p[0] + 2) + '">' + p[1] + '</div>';
   }).join("");
-  var grid = cols.map(function(w){ return '<div class="col">' + w.c + '</div>'; }).join("");
+  // span 必须夹在网格内，否则 grid 会生成隐式列，把宽度撑出去（历史实现的潜在溢出源）。
+  var months = monthLabels.map(function(l){
+    return '<div class="mcell" style="grid-column:' + l.col + ' / span ' +
+      Math.max(1, Math.min(3, nc + 2 - l.col)) + '">' + l.text + '</div>';
+  }).join("");
 
-  // 图例色块必须内联写尺寸：这个 div 在 .hm 容器之外，.hm .legend i 选择器匹配不到，
-  // 而裸 <i> 是行内元素、没有宽高 —— 之前就是在这里变成「少 [空白] 多」的。
+  // 图例色块必须内联写尺寸：这个 div 在 .hm 容器之外，.hm .legend i 选择器匹配不到。
   var sw = function(bg){
     return '<i style="display:inline-block;width:11px;height:11px;border-radius:3px;background:' + bg + '"></i>';
   };
   var legend = '<div class="legend" style="margin:10px 0 0;justify-content:flex-end;gap:4px">少' +
     sw("var(--track)") + sw("#dbe6fe") + sw("#a8c2fb") + sw("#6b93f8") + sw("#2f57d6") + '多</div>';
 
-  var total = daily.reduce(function(a, d){ return a + d.tokens; }, 0);
-  var active = daily.filter(function(d){ return d.tokens > 0; }).length;
-  var gcols = 'grid-template-columns:repeat(' + nc + ',minmax(0,1fr))';
+  var total = daily.reduce(function(a, d){ return a + num(d && d.tokens); }, 0);
+  var active = daily.filter(function(d){ return d && num(d.tokens) > 0; }).length;
 
   return '<div class="card" style="margin-top:12px">' +
     '<h3>Token 热力图 · 最近 12 个月（' + active + ' 天有调用 · 合计 ' + fmt(total) + '）</h3>' +
-    '<div class="hm" style="--cell:' + cell + 'px;--gap:' + gap + 'px;--minw:' + (nc * (cell + gap)) + 'px">' +
-      '<div class="dow">' + dow + '</div>' +
+    '<div class="hm" style="--gap:' + gap + 'px;--minw:' + (nc * (cellMin + gap)) + 'px">' +
       '<div class="cols">' +
-        '<div class="months-grid" style="' + gcols + '">' + months + '</div>' +
-        '<div class="grid" style="' + gcols + '">' + grid + '</div>' +
+        '<div class="hm-grid" style="grid-template-columns:14px repeat(' + nc +
+          ',minmax(0,1fr));grid-template-rows:auto repeat(7,auto)">' +
+          months + dow + cells.join("") +
+        '</div>' +
       '</div>' +
     '</div>' + legend + '</div>';
 }
 
 function modelCard(t){
-  var models = t.models || [];
+  var models = (t && t.models) || [];
   if (!models.length) return '<div class="card" style="margin-top:12px"><h3>按模型的调用情况</h3>' +
     '<div class="muted small">该范围内暂无模型调用</div></div>';
-  var maxTok = Math.max.apply(null, [1].concat(models.map(function(m){ return m.tokens; })));
-  var rows = models.map(function(m){
-    var denom = (m.read||0) + (m.input||0);
-    var hit = denom > 0 ? m.read/denom : 0;
-    var freshPct = Math.max(0, (1-hit) * 100);
-    var cachePct = Math.max(0, hit * 100);
+  var rows = models.map(function(m, i){
+    m = m || {};
+    var tok = num(m.tokens);
+    var rd = num(m.read);
+    var ix = num(m.input);
+    var denom = rd + ix;
+    // 缓存命中率 = 缓存读取 /（缓存读取 + 新输入）；分母为 0 时按 0 显示。
+    var hit = denom > 0 ? rd / denom : 0;
     var hitColor = hit >= .8 ? 'var(--good)' : hit >= .5 ? 'var(--warn)' : 'var(--bad)';
-    return '<div class="mrow"><div>' +
-      '<div class="mname">' + esc(m.name) + ' <span class="small muted">' + esc(m.providerID||"") + '</span></div>' +
-      '<div class="msub">' + fmtInt(m.requests) + ' 次请求 · ' + fmtInt(m.tools||0) + ' 工具 · 占比 ' + pct(m.share) + '</div>' +
-      // 份额条（相对最高模型，单色）
-      '<div class="track2" title="token 总量占最高模型的比例"><i style="width:' + ((m.tokens/maxTok)*100).toFixed(1) + '%"></i></div>' +
-      // 命中率条：浅蓝=命中(左)，橙=未命中(右)。命中率普遍很高，所以未命中段强制最小可见宽度。
-      '<div class="track3" title="缓存命中 ' + pct(hit) + '（命中 ' + fmt(m.read) + ' / 未命中 ' + fmt(m.input) + '）">' +
-        '<i class="cm-hit-hit" style="width:' + (freshPct > 0 ? 100 - Math.max(freshPct, 1.6) : 100).toFixed(2) + '%"></i>' +
-        (freshPct > 0 ? '<i class="cm-hit-miss" style="width:' + Math.max(freshPct, 1.6).toFixed(2) + '%"></i>' : '') +
+    // 条长 = m.share（该模型 token / **窗口内全部模型** token），不退化为「相对最大模型」。
+    // 缺失 / NaN / 越界一律夹到 [0,1]，避免 0 token 或异常数据把布局撑破。
+    var share = num(m.share);
+    if (share < 0) share = 0;
+    if (share > 1) share = 1;
+    // 浅色段 = 该模型的缓存读取 token。它与条长同分母（窗口内全部模型 token），
+    // 所以它在整条上的实际宽度 = share × (缓存读取 / 该模型 token)。0 时不渲染该段。
+    var cacheFrac = (tok > 0 && rd > 0) ? Math.min(1, rd / tok) : 0;
+    var seg = cacheFrac > 0
+      ? '<i class="tc" style="width:' + (cacheFrac * 100).toFixed(2) + '%"></i>' : "";
+    var rank = (i + 1) < 10 ? "0" + (i + 1) : String(i + 1);
+    var label = String(m.name == null ? "" : m.name) + "：token 份额 " + pct(share) +
+      (cacheFrac > 0 ? "，其中缓存读取 " + pct(cacheFrac) : "，无缓存读取");
+    return '<div class="mrow" data-model="' + esc(m.name) + '" data-share="' + share.toFixed(6) +
+        '" data-cache-frac="' + cacheFrac.toFixed(6) + '" data-tokens="' + tok +
+        '" data-read="' + rd + '" data-input="' + ix + '">' +
+      '<div class="mmain">' +
+        '<div class="mname"><span class="rank" aria-hidden="true">' + rank + '</span>' + esc(m.name) +
+          ' <span class="small muted">' + esc(m.providerID || "") + '</span></div>' +
+        '<div class="msub">' + fmt(tok) + ' tokens · 缓存命中率 <b style="color:' + hitColor + '">' +
+          pct(hit) + '</b> <span class="muted">（命中 ' + fmt(rd) + ' / 新输入 ' + fmt(ix) +
+          ' · ' + fmtInt(m.requests) + ' 次请求 · ' + fmtInt(m.tools || 0) + ' 工具）</span></div>' +
+        // 每个模型**只有这一条**进度条：<i class="tf"> 是份额段，里面再叠浅色的缓存读取段。
+        '<div class="track" role="img" aria-label="' + esc(label) + '" title="' + esc(label) + '">' +
+          '<i class="tf" style="width:' + (share * 100).toFixed(2) + '%">' + seg + '</i>' +
+        '</div>' +
       '</div>' +
-      '<div class="msub" style="margin-top:4px">缓存命中 <b style="color:' + hitColor + '">' + pct(hit) + '</b>' +
-        ' <span class="muted">（命中 ' + fmt(m.read) + ' / 新输入 ' + fmt(m.input) + '）</span></div>' +
-    '</div><div class="mval">' + fmt(m.tokens) + '</div></div>';
+      '<div class="mval">' + pct(share) + '</div></div>';
   }).join("");
 
-  return '<div class="card" style="margin-top:12px">' +
-    '<h3>按模型的调用情况</h3>' +
+  // data-model-total 是 share 的分母（窗口内全部模型 token，含未展示的模型），
+  // 便于回归测试直接核对 share 的口径，而不是「相对最大模型」。
+  var shownTotal = models.reduce(function(a, m){ return a + num(m && m.tokens); }, 0);
+  return '<div class="card" style="margin-top:12px" data-model-total="' +
+      num(t && t.modelTotal !== undefined ? t.modelTotal : shownTotal) +
+      '" data-model-count="' + num(t && t.modelCount !== undefined ? t.modelCount : models.length) +
+      '" data-model-shown="' + models.length + '"><h3>按模型的调用情况</h3>' +
     '<div class="legend" style="margin-bottom:6px">' +
-      '<span class="dot cm-hit-hit"></span>缓存命中' +
-      '<span class="dot cm-hit-miss" style="margin-left:8px"></span>未命中（新输入）' +
+      '<span class="dot" style="background:var(--accent)"></span>token 份额（分母 = 全部模型 token）' +
+      '<span class="dot" style="background:#8fb0fb;margin-left:8px"></span>浅色段 = 该模型的缓存读取' +
     '</div>' + rows + '</div>';
 }
 
-function tokenCard(t){
-  var tot = t.totals || {};
+// ---- 时间尺度（今日 / 7 天 / 30 天）----
+// 三份窗口数据在生成时就算好并内联进 DATA.token.windows。切换只是换一份**已经存在**的
+// 数字：不重新读库、不发请求、不重新生成 HTML、不依赖服务端（C1/C2/C4）。
+var _WIN = null;   // 当前选中的窗口 key；null = 用 payload 默认（--days 对应的那一份）
 
-  // 8 个统计小卡片（两行 × 4）
-  // 字段名与 Python card_data 的 totals 严格对应：input/output 为原始值，
-  // 缓存在 cacheRead（不是 read —— 之前写错导致「缓存读取 0」）。
+function windowKeys(t){
+  var w = t && t.windows;
+  if (!w || typeof w !== "object") return [];
+  var keys = t.windowKeys;
+  if (!keys || !keys.length) keys = Object.keys(w);
+  return keys.filter(function(k){ return k && w[k]; })
+             .sort(function(a, b){ return num(a) - num(b); });
+}
+function winLabel(k){
+  var n = num(k);
+  if (n === 1) return "今日";
+  return n > 0 ? n + " 天" : String(k);
+}
+// 界面上的一句话口径。30 天保持与原实现逐字一致（回归基线）。
+function winScope(k, days){
+  if (k == null || k === "") return "最近 " + (num(days) || 30) + " 天";
+  var n = num(k);
+  if (n === 1) return "今日（本地 00:00 起）";
+  return n > 0 ? "最近 " + n + " 天" : String(k);
+}
+// 当前要显示的窗口。旧版 payload 没有 windows 时退回顶层字段（受 --days 限制），安全降级。
+function currentWindow(t){
+  t = t || {};
+  var keys = windowKeys(t);
+  var legacy = { days: t.days, totals: t.totals, models: t.models, recent: t.recent };
+  if (!keys.length) return { key: null, win: legacy };
+  var pick = (_WIN != null && t.windows[_WIN]) ? _WIN : null;
+  if (pick == null){
+    var d = String(num(t.days) || 30);
+    pick = t.windows[d] ? d : (t.windows["30"] ? "30" : keys[keys.length - 1]);
+  }
+  return { key: pick, win: t.windows[pick] || legacy };
+}
+function winControl(keys, sel){
+  return '<div class="tscale"><div class="seg" role="group" aria-label="时间尺度">' +
+    keys.map(function(k){
+      return '<button type="button" data-win="' + esc(k) + '" aria-pressed="' +
+        (k === sel ? "true" : "false") + '">' + winLabel(k) + '</button>';
+    }).join("") + '</div>' +
+    // 不同口径必须写清楚：会话数与热力图不随时间尺度变化，避免被当成窗口内的数字。
+    '<div class="scope">口径：' + esc(winScope(sel, null)) +
+      '，按本地自然日 00:00 切分；<b>会话数</b>为全部会话总数，<b>热力图</b>为最近 12 个月，二者均不随时间尺度变化。' +
+    '</div></div>';
+}
+
+function tokenCard(t){
+  t = t || {};
+  var cur = currentWindow(t);
+  var w = cur.win || {};
+  var tot = w.totals || {};
+  var keys = windowKeys(t);
+
+  // 8 个统计小卡片（两行 × 4），全部是**当前时间窗口**口径。
+  // 字段名与 Python card_data 的 totals 严格对应：input/output 为原始值，缓存在 cacheRead。
   var cards = [
-    ['输入 tokens（含缓存读取）', fmt((tot.input||0) + (tot.cacheRead||0))],
-    ['输出 tokens', fmt((tot.output||0) + (tot.reasoning||0))],
-    ['缓存读取', fmt(tot.cacheRead)],
-    ['缓存命中率', pct(tot.cacheShare)],
-    ['请求数', fmtInt(tot.requests)],
-    ['工具调用', fmtInt(tot.tools)],
-    ['会话数', fmtInt(tot.sessions)],
-    ['平均每次请求', fmt(tot.requests ? tot.tokens/tot.requests : 0) + ' tok']
+    { k: '输入 tokens（含缓存读取）', v: fmt(num(tot.input) + num(tot.cacheRead)) },
+    { k: '输出 tokens', v: fmt(num(tot.output) + num(tot.reasoning)) },
+    { k: '缓存读取', v: fmt(tot.cacheRead) },
+    { k: '缓存命中率', v: pct(tot.cacheShare) },
+    { k: '请求数', v: fmtInt(tot.requests) },
+    { k: '工具调用', v: fmtInt(tot.tools) },
+    // 会话数来自 session 表全量行数，不随窗口变化；这里显式标注，避免与窗口内数字混淆。
+    { k: '会话数', v: fmtInt(tot.sessions), t: '全部会话总数，不随时间尺度变化' },
+    { k: '平均每次请求', v: fmt(num(tot.requests) ? num(tot.tokens) / num(tot.requests) : 0) + ' tok' }
   ].map(function(c){
-    return '<div class="card"><div class="num">' + c[1] + '</div><div class="lb">' + c[0] + '</div></div>';
+    return '<div class="card"' + (c.t ? ' title="' + esc(c.t) + '"' : '') + '><div class="num">' +
+      c.v + '</div><div class="lb">' + c.k + '</div></div>';
   }).join("");
 
-  return '<div class="card hero">' +
-    '<div class="label">最近 ' + (t.days||30) + ' 天 · tokens 消耗</div>' +
+  return (keys.length >= 2 ? winControl(keys, cur.key) : "") +
+    '<div class="card hero">' +
+    '<div class="label">' + esc(winScope(cur.key, w.days)) + ' · tokens 消耗</div>' +
     '<div class="big">' + fmt(tot.tokens) + '<span>tokens</span></div>' +
-    sparkline(t.recent || t.daily) + '</div>' +
+    sparkline(w.recent || t.daily) + '</div>' +
     '<div class="grid4" style="margin-top:12px">' + cards + '</div>' +
     heatmapCard(t) +
-    modelCard(t);
+    modelCard(w);
 }
 
 function sparkline(daily){
   var spark = (daily || []).slice(-30);
-  var maxD = Math.max.apply(null, [1].concat(spark.map(function(d){ return d.tokens; })));
+  var maxD = Math.max.apply(null, [1].concat(spark.map(function(d){ return num(d && d.tokens); })));
   var bars = spark.map(function(d){
-    return '<i style="height:' + Math.max(3, (d.tokens/maxD)*40).toFixed(1) + 'px" title="' + d.date + ' · ' + fmt(d.tokens) + '"></i>';
+    d = d || {};
+    return '<i style="height:' + Math.max(3, (num(d.tokens)/maxD)*40).toFixed(1) + 'px" title="' +
+      esc(d.date) + ' ' + esc(dowOf(d.date)) + ' · ' + fmt(d.tokens) + ' tokens"></i>';
   }).join("");
   return '<div class="spark">' + bars + '</div>';
+}
+
+// ---- 热力图悬浮提示层（UI-1）----
+// 自绘固定定位层，读格子的 data-tip。贴近视口右/下边缘时自动夹紧或翻转到格子下方。
+function tipLayer(){
+  try {
+    var el = document.getElementById("hm-tip");
+    if (el) return el;
+    if (!document.body || typeof document.createElement !== "function") return null;
+    el = document.createElement("div");
+    el.id = "hm-tip";
+    el.className = "hm-tip";
+    el.setAttribute("role", "tooltip");
+    el.hidden = true;
+    document.body.appendChild(el);
+    return el;
+  } catch (e) { return null; }
+}
+function placeTip(el, cell){
+  try {
+    var r = cell.getBoundingClientRect();
+    var bw = num(el.offsetWidth) || 220, bh = num(el.offsetHeight) || 24;
+    var vw = (typeof window !== "undefined" && num(window.innerWidth)) || 1024;
+    var vh = (typeof window !== "undefined" && num(window.innerHeight)) || 768;
+    var x = r.left + r.width / 2 - bw / 2;
+    if (x + bw > vw - 6) x = vw - bw - 6;
+    if (x < 6) x = 6;
+    var y = r.top - bh - 8;
+    if (y < 6) y = Math.min(r.bottom + 8, vh - bh - 6);
+    el.style.left = x.toFixed(1) + "px";
+    el.style.top = y.toFixed(1) + "px";
+  } catch (e) { /* 拿不到布局时静默跳过：提示层本身照常显示 */ }
+}
+// 事件委托挂在 root 上，所以切换视图/时间尺度导致的 innerHTML 重建不会丢监听。
+function wireHeatmap(host){
+  if (!host || typeof host.addEventListener !== "function") return false;
+  var tip = null;
+  var cellOf = function(node){
+    return (node && typeof node.closest === "function") ? node.closest(".hm .cell") : null;
+  };
+  var show = function(ev){
+    var cell = cellOf(ev.target);
+    if (!cell){ if (tip) tip.hidden = true; return; }
+    if (!tip) tip = tipLayer();
+    if (!tip) return;
+    tip.textContent = cell.getAttribute("data-tip") || "";
+    tip.hidden = false;
+    placeTip(tip, cell);
+  };
+  host.addEventListener("mouseover", show);
+  host.addEventListener("focusin", show);
+  host.addEventListener("mousemove", function(ev){
+    if (!tip || tip.hidden) return;
+    var cell = cellOf(ev.target);
+    if (cell) placeTip(tip, cell);
+  });
+  host.addEventListener("mouseout", function(ev){
+    if (tip && cellOf(ev.target)) tip.hidden = true;
+  });
+  return true;
 }
 
 function sessionCard(s){
@@ -822,6 +1166,57 @@ function sessionCard(s){
     '<div class="card" style="margin-top:12px"><h3>最近会话（按活跃排序）</h3>' +
     '<div class="tw"><table><thead><tr><th>会话</th><th>模型</th><th class="right">Tokens</th><th class="right">请求</th><th class="right">工具</th><th class="right">更新</th></tr></thead>' +
     '<tbody>' + rows + '</tbody></table></div></div>';
+}
+
+// ---- 上下文用量分类树 ----
+// 只展示数据库里真实存在、可逐项核对的字段。单位不同的分支分开标注（tokens / 次 / 条），
+// 不把输入 token、缓存读取 token、输出 token、请求次数或会话数混为一谈，也不做任何
+// 「按比例分摊」的猜测；库中还原不出来的分类明确列出并说明原因。
+function treeKids(branch, path){
+  var kids = (branch && branch.children) || [];
+  var total = num(branch && branch.total);
+  var unit = String((branch && branch.unit) || "");
+  if (!kids.length){
+    return '<div class="tkids" id="' + path + '" role="group">' +
+      '<div class="tnote">（无可细分的子项）</div></div>';
+  }
+  return '<div class="tkids" id="' + path + '" role="group">' + kids.map(function(c){
+    var v = num(c && c.value);
+    return '<div class="trow tchild" role="treeitem" aria-level="2" data-leaf="' +
+        esc(c && c.label) + '" data-value="' + v + '">' +
+      '<span class="tw" aria-hidden="true"></span>' +
+      '<span class="tl">' + esc(c && c.label) + '</span>' +
+      '<span class="tu muted small">' + (total > 0 ? pct(v / total) : "—") + '</span>' +
+      '<span class="tv">' + fmt(v) + ' ' + esc(unit) + '</span></div>';
+  }).join("") + '</div>';
+}
+function contextTree(bd){
+  var branches = (bd && bd.branches) || [];
+  if (!branches.length){
+    return '<div class="card" style="margin-top:12px"><h3>上下文用量分类</h3>' +
+      '<div class="muted small">可细分的上下文数据不足，暂无可展示的分类</div></div>';
+  }
+  var rows = branches.map(function(b, i){
+    var path = "tk-" + i;
+    var kids = (b && b.children) || [];
+    return '<div class="trow" role="treeitem" aria-level="1" aria-expanded="true"' +
+        ' aria-controls="' + path + '" tabindex="0" data-tree-toggle="' + path + '"' +
+        ' data-branch="' + esc(b.label) + '" data-unit="' + esc(b.unit) +
+        '" data-total="' + num(b.total) + '">' +
+      '<span class="tw" aria-hidden="true">' + (kids.length ? "▾" : "·") + '</span>' +
+      '<span class="tl">' + esc(b.label) + '</span>' +
+      '<span class="tu muted small">' + esc(b.unit) + '</span>' +
+      '<span class="tv">' + fmt(b.total) + '</span></div>' +
+      '<div class="tnote">' + esc(b.note) + '</div>' +
+      treeKids(b, path);
+  }).join("");
+  var na = (bd && bd.notSubdividable) || {};
+  var labels = (na.labels || []).map(function(x){ return esc(x); }).join(" / ");
+  return '<div class="card" style="margin-top:12px"><h3>上下文用量分类</h3>' +
+    '<div class="tree" role="tree" aria-label="上下文用量分类">' + rows + '</div>' +
+    '<div class="tdisc"><b>可核对</b>：每个分支的合计等于其子项之和（差额单列为「未分类」）；' +
+      '「次」与「条」是计数口径，不与 tokens 相加。<br>' +
+      '<b>无法细分</b>：' + (labels || "—") + '。<br>' + esc(na.reason || "") + '</div></div>';
 }
 
 function contextCard(c){
@@ -872,13 +1267,59 @@ function contextCard(c){
     '<div class="stat-line"><span class="muted">改动</span><b>+' + fmtInt(c.additions) + ' / -' + fmtInt(c.deletions) + ' · ' + fmtInt(c.files) + ' 文件</b></div>' +
     '<div class="stat-line"><span class="muted">最近活动</span><b>' + timeCN(c.lastActivity) + '</b></div>' +
     '<div class="stat-line"><span class="muted">数据来源</span><b><span class="pill">' + esc(c.context.source) + '</span>' + (c.compacting ? ' <span class="pill">压缩中</span>' : "") + '</b></div>' +
-    '</div>';
+    '</div>' +
+    contextTree(c.breakdown);
 }
 
-function renderTab(kind, data){
-  if (kind === "token") return tokenCard(data.token || { totals:{}, models:[], daily:[], days:30 });
-  if (kind === "session") return sessionCard(data.session || { top: [] });
-  if (kind === "context") return contextCard(data.context);
+// ---- 分类树的展开 / 折叠 + 键盘操作 ----
+// 分支行是 tabindex=0 的 role=treeitem：Enter / Space 切换，← 折叠，→ 展开。
+function toggleTreeNode(node){
+  if (!node || typeof node.getAttribute !== "function") return null;
+  var id = node.getAttribute("aria-controls") || node.getAttribute("data-tree-toggle");
+  var next = node.getAttribute("aria-expanded") === "false";
+  node.setAttribute("aria-expanded", next ? "true" : "false");
+  try {
+    var kids = id ? document.getElementById(id) : null;
+    if (kids) kids.hidden = !next;
+  } catch (e) { /* 折叠容器缺失时状态属性仍然更新，可访问性语义不受影响 */ }
+  try {
+    var mk = typeof node.querySelector === "function" ? node.querySelector(".tw") : null;
+    if (mk) mk.textContent = next ? "▾" : "▸";
+  } catch (e) { /* 同上 */ }
+  return next;
+}
+function wireTree(host){
+  if (!host || typeof host.addEventListener !== "function") return false;
+  var nodeOf = function(node){
+    if (!node || typeof node.closest !== "function") return null;
+    var n = node.closest("[data-tree-toggle]");
+    if (!n) return null;
+    if (typeof host.contains === "function" && !host.contains(n)) return null;
+    return n;
+  };
+  host.addEventListener("click", function(ev){
+    var n = nodeOf(ev.target);
+    if (n) toggleTreeNode(n);
+  });
+  host.addEventListener("keydown", function(ev){
+    var n = nodeOf(ev.target);
+    if (!n) return;
+    var k = ev.key, open = n.getAttribute("aria-expanded") !== "false";
+    if (k === "ArrowRight"){ if (open) return; }
+    else if (k === "ArrowLeft"){ if (!open) return; }
+    else if (k !== "Enter" && k !== " " && k !== "Spacebar") return;
+    if (ev.preventDefault) ev.preventDefault();
+    toggleTreeNode(n);
+  });
+  return true;
+}
+
+function renderTab(kind, data, win){
+  // 显式传 win 时切换当前窗口（内部与测试用）；只传两个参数时沿用当前选择。
+  if (win !== undefined) _WIN = win;
+  if (kind === "token") return tokenCard((data && data.token) || { totals:{}, models:[], daily:[], days:30 });
+  if (kind === "session") return sessionCard((data && data.session) || { top: [] });
+  if (kind === "context") return contextCard(data && data.context);
   return "";
 }
 
@@ -949,11 +1390,28 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "") -> str:
   var OUT = {json.dumps(out_path)};
   {_RUNTIME}
   var root = document.getElementById("root");
+  // 当前视图 / 当前时间尺度。_WIN 为 null 时用 payload 的默认窗口（--days 对应的那一份）。
+  var _TAB = (DATA.kind && DATA.kind !== "all") ? DATA.kind : "token";
   root.innerHTML = buildBody(DATA) + footer(DATA);
+  // 事件委托挂 root：切换视图或时间尺度后 innerHTML 被重建，监听依然有效。
+  wireHeatmap(root);
+  wireTree(root);
   root.addEventListener("click", function(ev){{
     var btn = ev.target && ev.target.closest ? ev.target.closest("[data-tab]") : null;
-    if (!btn) return;
+    if (!btn) {{
+      // 时间尺度切换：只换用已经内联进 DATA 的另一份窗口数据。
+      // 不读数据库、不发请求、不重新生成 HTML。
+      var wbtn = ev.target && ev.target.closest ? ev.target.closest("[data-win]") : null;
+      if (wbtn) {{
+        _WIN = wbtn.getAttribute("data-win");
+        var host = document.getElementById("tab-content");
+        if (host) {{ host.innerHTML = renderTab(_TAB, DATA); }}
+        else {{ root.innerHTML = buildBody(DATA) + footer(DATA); }}
+      }}
+      return;
+    }}
     var selected = btn.getAttribute("data-tab");
+    _TAB = selected;
     root.querySelectorAll("[data-tab]").forEach(function(tab){{
       tab.setAttribute("aria-selected", tab === btn ? "true" : "false");
     }});

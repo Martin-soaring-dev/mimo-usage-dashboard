@@ -173,17 +173,26 @@ skill/usage/                /usage 命令说明
 skill/mimo-usage-dashboard/ 用量看板说明（纯文档，不执行任何操作）
 docs/architecture.md        架构与引擎机制实证（命令注册、shell 替换、为何弃用服务）
 docs/plugin-interface.md    MiMo 插件接口调研（Hooks / ToolContext / 加载机制）
-test/test_python.py         Python 端到端测试（聚合口径 / 视图 / 注入防护 / JSONC）
+test/test_python.py         Python 端到端测试（聚合口径 / 视图 / 注入防护 / JSONC / 只读保证）
+test/runtime-check.mjs      在 VM 沙箱里真实执行内联 JS，渲染四种视图
 test/command-e2e.mjs        Node 侧：模拟引擎的模板替换与 shell 提取
+test/ui-dom.mjs             内联 JS 的 UI 行为回归（热力图提示 / 时间尺度 / 模型条 / 分类树）
+test/ui-geometry.mjs        真实浏览器（无头 Chrome + CDP）的几何回归，见下
+test/cdp.mjs                无头 Chrome + CDP 的最小封装（被上面两个文件共用）
 ```
 
 ## 开发
 
 ```bash
-npm test                    # = python test/test_python.py（51 项断言）
-node test/command-e2e.mjs   # 模板形状与引擎行为模拟
+npm test                    # Python + runtime + command-e2e + ui-dom（不需要浏览器）
+node test/ui-geometry.mjs   # 真实浏览器几何验证；本机无 Chrome 时自动 SKIP
 python usage_cli.py --open  # 手动查看
 ```
+
+`test/ui-geometry.mjs` 量的是**真实布局**（12 个月是否完整、有无横向滚动、
+星期标签与日期行的像素偏差、进度条实际宽度、分类树的展开折叠与键盘操作），
+所以它没有被挂进 `npm test`：`npm test` 必须在任何机器上都能确定性通过。
+用 `--shots <dir>` 可额外导出截图供人工复核（数据全部是临时合成库，不含真实内容）。
 
 ## 排错
 

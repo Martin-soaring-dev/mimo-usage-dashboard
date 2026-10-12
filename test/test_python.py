@@ -41,10 +41,7 @@ def check(name: str, ok: bool, extra: str = "") -> None:
 # 造一个最小可用的 mimocode.db
 # ---------------------------------------------------------------------------
 
-def make_db(path: str, now_ms: int) -> None:
-    conn = sqlite3.connect(path)
-    conn.executescript(
-        """
+SCHEMA_SQL = """
         CREATE TABLE session (
           id text PRIMARY KEY, project_id text NOT NULL DEFAULT 'p', parent_id text,
           slug text NOT NULL DEFAULT 's', directory text NOT NULL DEFAULT 'D:/proj',
@@ -65,8 +62,12 @@ def make_db(path: str, now_ms: int) -> None:
           id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL,
           time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
         );
-        """
-    )
+"""
+
+
+def make_db(path: str, now_ms: int) -> None:
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_SQL)
     conn.execute(
         "INSERT INTO session (id,title,directory,time_created,time_updated,"
         "summary_additions,summary_deletions,summary_files) VALUES (?,?,?,?,?,?,?,?)",
@@ -108,6 +109,99 @@ def make_db(path: str, now_ms: int) -> None:
     msg("m3", "s2", now_ms - 800_000,
         {"total": 500, "input": 200, "output": 50, "reasoning": 0,
          "cache": {"read": 250, "write": 0}})
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 「贴近真实形态」的大库：跨 12+ 个月、多模型、多 part 类型、含无数据日
+# 供 UI 几何 / 行为回归测试使用（几何断言需要真实的月份跨度与列数）。
+# ---------------------------------------------------------------------------
+
+RICH_MODELS = (
+    # providerID, modelID, 单条 assistant 消息的 tokens 组成
+    ("xiaomi-token-plan-cn", "mimo-v2.6-pro",
+     {"input": 800, "output": 200, "reasoning": 100, "cache": {"read": 900, "write": 0}}),
+    ("xiaomi-token-plan-cn", "mimo-v2.6-flash",
+     {"input": 5000, "output": 300, "reasoning": 50, "cache": {"read": 100, "write": 0}}),
+    ("deepseek", "deepseek-v4-flash",
+     {"input": 0, "output": 700, "reasoning": 0, "cache": {"read": 0, "write": 0}}),
+    ("glm", "glm-5.3",
+     {"input": 200, "output": 100, "reasoning": 0, "cache": {"read": 9800, "write": 0}}),
+)
+RICH_TOOLS = ("bash", "read", "write", "edit")
+RICH_GAP_EVERY = 11   # 每 11 天留一天没有调用 → 热力图里必须出现「无调用」格子
+
+
+def _local_noon_ms(days_ago: int) -> int:
+    """当天的本地 12:00 —— 避开时区/夏令时把行算到相邻日期。"""
+    from datetime import datetime as _dt, timedelta as _td
+    d = (_dt.now() - _td(days=days_ago)).replace(hour=12, minute=0, second=0, microsecond=0)
+    return int(d.timestamp() * 1000)
+
+
+def make_rich_db(path: str, days: int = 420) -> None:
+    """跨 ``days`` 天、多模型、多 part 类型的最小真实形态库（纯合成数据）。
+
+    - 每天 1 条 assistant 消息，轮流使用 RICH_MODELS 的 4 个模型；
+    - 每天 1 个 step-finish（上下文占用取最新一条）、1 个 text、3 个 tool
+      （其中 1 个故意不带 tool 名，用于验证「未知工具」归类）；
+    - 每 RICH_GAP_EVERY 天跳过一天，让热力图里存在真正的「无调用」日期；
+    - 近 1 / 7 / 30 天的量级差 50 / 10 / 3 倍，保证时间尺度切换后数字必然变化。
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_SQL)
+    conn.execute(
+        "INSERT INTO session (id,title,directory,time_created,time_updated,"
+        "summary_additions,summary_deletions,summary_files,context_watermark) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("sess-rich", "UI 回归会话", "D:/proj/ui", _local_noon_ms(days - 1),
+         _local_noon_ms(0), 421, 137, 12, "wm-1"),
+    )
+
+    msg_n = 0
+    part_n = 0
+    for i in range(days):
+        if i > 0 and i % RICH_GAP_EVERY == 7:
+            continue
+        if i == 0:
+            factor = 50          # 今日
+        elif i < 7:
+            factor = 10          # 近 7 天
+        elif i < 30:
+            factor = 3           # 近 30 天
+        else:
+            factor = 1           # 更早
+        prov, model, base = RICH_MODELS[i % len(RICH_MODELS)]
+        ts = _local_noon_ms(i)
+        msg_n += 1
+        msg_id = "m%d" % msg_n
+        tokens = {k: v * factor for k, v in base.items() if k != "cache"}
+        tokens["cache"] = {k: v * factor for k, v in base["cache"].items()}
+        tokens["total"] = (tokens["input"] + tokens["output"] + tokens["reasoning"]
+                           + tokens["cache"]["read"] + tokens["cache"]["write"])
+        conn.execute(
+            "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)",
+            (msg_id, "sess-rich", ts, ts,
+             json.dumps({"role": "assistant", "providerID": prov, "modelID": model,
+                         "time": {"created": ts}, "tokens": tokens})),
+        )
+
+        def _part(data: dict) -> None:
+            nonlocal part_n
+            part_n += 1
+            conn.execute(
+                "INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) "
+                "VALUES (?,?,?,?,?,?)",
+                ("p%d" % part_n, msg_id, "sess-rich", ts, ts, json.dumps(data)),
+            )
+
+        _part({"type": "step-finish", "tokens": tokens})
+        _part({"type": "text", "text": "…"})
+        for t in range(3):
+            if t == 2:
+                _part({"type": "tool"})                      # 缺 tool 名 → 未知工具
+            else:
+                _part({"type": "tool", "tool": RICH_TOOLS[(i + t) % len(RICH_TOOLS)]})
     conn.commit()
     conn.close()
 
@@ -174,7 +268,15 @@ def main() -> int:
             check(f"{kind}: 含模型调用块", "按模型的调用情况" in html)
             check(f"{kind}: 含缓存命中率", "缓存命中率" in html)
             check(f"{kind}: 输入 tokens 卡片包含缓存读取", '输入 tokens（含缓存读取）' in html)
-            check(f"{kind}: 模型块含命中率条", "track3" in html and "cm-hit-hit" in html)
+            check(f"{kind}: 模型块为单条进度条", 'class="track"' in html)
+            # UI-4：第二条 bar（track2/track3）与「未命中强制最小宽度」都必须消失。
+            # 注意 HTML 是 JS 外壳，模型行要到运行期才由 buildBody 渲染，
+            # 所以「每个模型恰好 1 条 bar」的计数断言在 test/ui-dom.mjs 里做。
+            check(f"{kind}: 旧的第二条 bar 已移除", "track2" not in html and "track3" not in html
+                  and "cm-hit-hit" not in html and "cm-hit-miss" not in html)
+            check(f"{kind}: 缓存读取改用浅色段", 'class="tc"' in html and 'class="tf"' in html)
+            check(f"{kind}: 不再按「相对最大模型」定条长", "相对最高模型" not in html and "maxTok" not in html)
+            check(f"{kind}: 未命中条不再强制最小宽度", "Math.max(freshPct, 1.6)" not in html)
             check(f"{kind}: 未命中条不再负 margin 覆盖", "margin-left:-1.6%" not in html)
             # 热力图数据必须覆盖全量（不受 --days 限制）+ 顶部趋势用范围内数据
             check(f"{kind}: token 数据含 daily(热力图)", '"daily"' in html)
@@ -259,6 +361,151 @@ def main() -> int:
           isinstance(do["token"]["totals"].get("sessions"), int)
           and do["token"]["totals"]["sessions"] == len(U.read_usage(db_odd)["sessions"]),
           f"(sessions={do['token']['totals'].get('sessions')})")
+
+    # ---- 3b. 时间尺度窗口（UI-3 的数据层） ----
+    print("\n=== 时间尺度窗口 ===")
+    from datetime import datetime as _dt, timedelta as _td
+    tk = U.card_data(db, kind="token", days=30)["token"]
+    check("windowKeys 固定包含 1/7/30", tk["windowKeys"] == ["1", "7", "30"], f"({tk['windowKeys']})")
+    check("三份窗口都内联进 payload", sorted(tk["windows"]) == ["1", "30", "7"], f"({sorted(tk['windows'])})")
+    shape30 = sorted(tk["windows"]["30"])
+    check("三份窗口结构一致", all(sorted(w) == shape30 for w in tk["windows"].values())
+          and {"days", "fromDate", "modelTotal", "modelCount", "totals", "models", "recent"} <= set(shape30),
+          f"({shape30})")
+    check("窗口 days 与 key 一致", all(w["days"] == int(k) for k, w in tk["windows"].items()))
+    today = U._local_date(now_ms)
+    exp29 = U._local_date(int((_dt.now() - _td(days=29)).timestamp() * 1000))
+    check("「今日」按自然日：fromDate = 今天（不是滚动 24 小时）",
+          tk["windows"]["1"]["fromDate"] == today,
+          f"({tk['windows']['1']['fromDate']} vs {today})")
+    check("「30 天」fromDate = 今天 - 29 天", tk["windows"]["30"]["fromDate"] == exp29,
+          f"({tk['windows']['30']['fromDate']} vs {exp29})")
+    check("顶层字段 == windows['30'] 逐值一致（回归基线）",
+          tk["totals"] == tk["windows"]["30"]["totals"]
+          and tk["recent"] == tk["windows"]["30"]["recent"]
+          and tk["models"] == tk["windows"]["30"]["models"])
+    check("--days 非 1/7/30 时补出自定义窗口（不篡改 --days 语义）",
+          U.card_data(db, kind="token", days=15)["token"]["windowKeys"] == ["1", "7", "15", "30"])
+
+    dbw = os.path.join(tmpdir, "windows.db")
+    make_rich_db(dbw)
+    wt = U.card_data(dbw, kind="token", days=30)["token"]
+    t1 = wt["windows"]["1"]["totals"]["tokens"]
+    t7 = wt["windows"]["7"]["totals"]["tokens"]
+    t30 = wt["windows"]["30"]["totals"]["tokens"]
+    check("今日 < 7 天 < 30 天（窗口口径独立，未互相污染）", 0 < t1 < t7 < t30, f"({t1} < {t7} < {t30})")
+    check("请求数同样随时间窗口递增",
+          wt["windows"]["1"]["totals"]["requests"] < wt["windows"]["7"]["totals"]["requests"]
+          < wt["windows"]["30"]["totals"]["requests"])
+    check("会话数在各窗口一致（全量口径，不随时间窗口漂移）",
+          len({w["totals"]["sessions"] for w in wt["windows"].values()}) == 1)
+    check("daily[] 带 read/input/requests（供热力图算当日缓存命中率）",
+          wt["daily"] and all({"date", "tokens", "read", "input", "requests"} <= set(d) for d in wt["daily"]))
+    check("daily 覆盖全量（不受 --days 限制），recent 只覆盖窗口",
+          len(wt["daily"]) > len(wt["windows"]["30"]["recent"]),
+          f"(daily={len(wt['daily'])} recent30={len(wt['windows']['30']['recent'])})")
+    check("模型 share 以窗口内全部模型 token 为分母",
+          abs(sum(m["share"] for m in wt["windows"]["30"]["models"]) - 1.0) < 1e-9,
+          f"({sum(m['share'] for m in wt['windows']['30']['models'])})")
+    check("modelTotal == 窗口内模型 token 之和",
+          wt["windows"]["30"]["modelTotal"] == sum(m["tokens"] for m in wt["windows"]["30"]["models"]))
+
+    # ---- 3c. 上下文用量分类树（数据层） ----
+    print("\n=== 上下文用量分类树 ===")
+    cx = U.session_context(dbw)
+    bd = cx["breakdown"]
+    byname = {b["label"]: b for b in bd["branches"]}
+    check("4 个分支：快照 / 累计 / 工具调用 / 消息片段",
+          [b["label"] for b in bd["branches"]] == ["当前上下文快照", "本会话累计", "工具调用", "消息片段构成"],
+          f"({[b['label'] for b in bd['branches']]})")
+    check("单位分别标注（tokens/tokens/次/条），不同口径不混算",
+          [b["unit"] for b in bd["branches"]] == ["tokens", "tokens", "次", "条"])
+    check("每个分支的子项之和 == 分支合计（分类结果可核对）",
+          all(sum(c["value"] for c in b["children"]) == b["total"] for b in bd["branches"]),
+          f"({[(b['label'], sum(c['value'] for c in b['children']), b['total']) for b in bd['branches']]})")
+    check("快照分支合计 == context.used", byname["当前上下文快照"]["total"] == cx["context"]["used"])
+    detail = cx["context"]["detail"]
+    check("快照子项与 context.detail 逐项一致",
+          {c["label"]: c["value"] for c in byname["当前上下文快照"]["children"]} ==
+          {"缓存读取": detail["read"], "新输入": detail["input"], "推理": detail["reasoning"],
+           "输出": detail["output"], "缓存写入": detail["write"]})
+    check("累计分支合计 == 本会话 assistant 消息 tokens 之和",
+          byname["本会话累计"]["total"] == cx["tokens"]["total"],
+          f"({byname['本会话累计']['total']} vs {cx['tokens']['total']})")
+    check("累计口径与快照口径是两个不同的数字（未被混为一谈）",
+          byname["本会话累计"]["total"] != byname["当前上下文快照"]["total"])
+
+    conn_w = sqlite3.connect(dbw)
+    part_rows = [json.loads(r[0]) for r in conn_w.execute("SELECT data FROM part").fetchall()]
+    n_parts = len(part_rows)
+    n_tools = sum(1 for d in part_rows if isinstance(d, dict) and d.get("type") == "tool")
+    n_unknown_tools = sum(1 for d in part_rows
+                          if isinstance(d, dict) and d.get("type") == "tool"
+                          and not (isinstance(d.get("tool"), str) and d["tool"].strip()))
+    conn_w.close()
+    check("工具分支合计 == 库里 part.type=tool 的行数（独立核对）",
+          byname["工具调用"]["total"] == n_tools == cx["tools"], f"({n_tools})")
+    check("片段分支合计 == part 表行数（独立核对）",
+          byname["消息片段构成"]["total"] == n_parts, f"({n_parts})")
+    tool_kids = {c["label"]: c["value"] for c in byname["工具调用"]["children"]}
+    check("缺 tool 名的调用归入「未知工具」而不是被丢弃",
+          tool_kids.get("未知工具", 0) == n_unknown_tools > 0, f"({tool_kids})")
+    check("子项按次数降序排列（同次数按名称升序）",
+          [c["value"] for c in byname["工具调用"]["children"]] ==
+          sorted([c["value"] for c in byname["工具调用"]["children"]], reverse=True))
+    check("无法细分的分类被如实列出并给出原因",
+          set(bd["notSubdividable"]["labels"]) >= {"系统提示词", "内置工具清单", "Memory 文件", "Skills"}
+          and len(bd["notSubdividable"]["reason"]) > 20)
+    check("_branch：差额单列为「未分类」",
+          [c["label"] for c in U._branch("x", "tokens", "", 100, [("a", 40), ("b", 30)])["children"]]
+          == ["a", "b", "未分类"])
+    check("_branch：字段和超出总量时如实标记异常（不强行归零）",
+          U._branch("x", "tokens", "", 10, [("a", 40)])["children"][-1]
+          == {"label": "字段和超出总量", "value": 30})
+    check("_branch：空输入得到只有根节点的分支",
+          U._branch("x", "次", "", 0, []) == {"label": "x", "unit": "次", "note": "",
+                                             "total": 0, "children": []})
+    check("_counted：合并重复类别并按次数降序",
+          U._counted(["bash", "bash", "read"], "未知工具") == [("bash", 2), ("read", 1)])
+    check("_counted：空值/空白/非字符串一律归入未知类别",
+          U._counted([None, "", "  ", 0, True, {}, "bash"], "未知工具")
+          == [("未知工具", 6), ("bash", 1)])
+    check("_counted：空输入返回空列表", U._counted([], "未知工具") == [])
+    db_nomsg = os.path.join(tmpdir, "nomsg.db")
+    make_db(db_nomsg, now_ms)
+    cn = sqlite3.connect(db_nomsg)
+    cn.executescript("DELETE FROM part; DELETE FROM message;")
+    cn.commit()
+    cn.close()
+    nb = U.session_context(db_nomsg)["breakdown"]["branches"]
+    check("有会话但无消息/片段：分支合计全为 0 且不抛异常",
+          len(nb) == 4 and all(b["total"] == 0 and sum(c["value"] for c in b["children"]) == 0 for b in nb),
+          f"({[(b['label'], b['total'], len(b['children'])) for b in nb]})")
+    check("完全没有会话时安全返回 ok=False（不抛异常）",
+          U.session_context(db_empty).get("ok") is False,
+          f"({U.session_context(db_empty).get('error')})")
+
+    # ---- 3d. 只读保证（C5） ----
+    print("\n=== 只读保证 ===")
+    import hashlib
+    import inspect
+
+    def _digest(p):
+        with open(p, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    before = _digest(dbw)
+    U.read_usage(dbw)
+    U.card_data(dbw, kind="all")
+    U.session_context(dbw)
+    after = _digest(dbw)
+    check("聚合与渲染全程不修改数据库文件（C5）", before == after, f"({before[:12]}… vs {after[:12]}…)")
+    check("不产生 WAL/SHM 旁文件",
+          not os.path.exists(dbw + "-wal") and not os.path.exists(dbw + "-shm"))
+    check("连接使用只读 URI（mode=ro）", "mode=ro" in inspect.getsource(U._open_readonly))
+    check("源码中不存在写库语句（INSERT/UPDATE/DELETE/CREATE/ATTACH）",
+          not any(k in inspect.getsource(U) for k in
+                  ("INSERT INTO", "UPDATE ", "DELETE FROM", "CREATE TABLE", "ATTACH", "PRAGMA")))
 
     # ---- 4. 注入防护 ----
     print("\n=== 参数白名单（注入防护） ===")
