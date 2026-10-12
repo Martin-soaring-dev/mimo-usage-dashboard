@@ -59,8 +59,13 @@ cd mimo-usage-dashboard
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-It copies the CLI to `~/.config/mimocode/usage-dashboard/`, writes `command.usage` /
-`command.usage-open` into `mimocode.jsonc`, and cleans up leftovers from the old design.
+By default it copies the CLI to `~/.config/mimocode/usage-dashboard/` and registers `command.usage` / `command.usage-open`. If the local AI identifies a different active config path, pass it explicitly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -Config "C:\actual\path\mimocode.jsonc" -Python "C:\actual\path\python.exe"
+```
+
+You can also pass `-InstallDir`. The installer backs up the config and preserves legacy files by default; only use `-RemoveLegacy` after reviewing them. For local path discovery and user-confirmed live acceptance, see [Windows live test guide](./docs/windows-live-test-prompts.md).
 
 Then **fully restart MiMo Desktop** and **open a new session**.
 
