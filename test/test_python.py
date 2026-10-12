@@ -7,6 +7,7 @@
   2. 三种视图（token / session / context / all）的 HTML 结构
   3. 命令参数白名单防注入
   4. JSONC 剥离与注释容错
+  5. register_command 写入行为（备份唯一、原子写、字段保留、退出码、BOM）
 
 运行：python test/test_python.py
 """
@@ -230,10 +231,151 @@ def main() -> int:
     check("模板不透传用户参数到 shell", bool(shell_cmds) and "--arg-string" not in shell_cmds[0] and "$ARGUMENTS" not in shell_cmds[0])
     check("模板要求原样复述", "原样" in tpl)
 
+    # ---- 6. register_command 写入行为 ----
+    print("\n=== 配置注册行为 ===")
+    import contextlib
+    import io
+
+    reg_root = tempfile.mkdtemp(prefix="mimo-register-test-")
+    reg_py = sys.executable
+    reg_script = os.path.join(ROOT, "usage_cli.py")
+
+    def run_reg(cfg_path, extra=(), script=None):
+        argv = ["--config", cfg_path, "--python", reg_py,
+                "--script", script or reg_script] + list(extra)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = R.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def new_cfg(name, text, bom=False):
+        d = tempfile.mkdtemp(prefix=f"{name}-", dir=reg_root)
+        p = os.path.join(d, "mimocode.jsonc")
+        data = text.encode("utf-8")
+        with open(p, "wb") as fh:
+            fh.write(data if not bom else b"\xef\xbb\xbf" + data)
+        return d, p
+
+    def backups(d):
+        return sorted(n for n in os.listdir(d) if ".bak-" in n)
+
+    def load(path):
+        return json.loads(R.strip_jsonc(io.open(path, encoding="utf-8-sig").read()))
+
+    def read(path):
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    base_cfg = (
+        "{\n"
+        "  // 用户自己的注释\n"
+        '  "command": {\n'
+        '    "existing-command": {"description": "keep me", "template": "unchanged"},\n'
+        '    "usage": {"description": "old", "template": "old", "agent": "custom-agent"}\n'
+        "  },\n"
+        '  "plugin": ["usage-dashboard.mjs", "example-user-plugin.mjs"],\n'
+        '  "mcp": {}\n'
+        "}\n"
+    )
+
+    d1, p1 = new_cfg("preserve", base_cfg)
+    code1, out1, err1 = run_reg(p1)
+    j1 = load(p1)
+    check("register 返回 0", code1 == 0, f"(code={code1}, out={out1.strip()})")
+    check("无关命令条目保留", j1["command"]["existing-command"]["template"] == "unchanged")
+    check("命令条目自定义字段保留", j1["command"]["usage"].get("agent") == "custom-agent")
+    check("plugin 默认保留", j1["plugin"] == ["usage-dashboard.mjs", "example-user-plugin.mjs"])
+    check("顶层其它键保留", j1["mcp"] == {})
+    check("模板不透传用户参数", "$ARGUMENTS" not in j1["command"]["usage"]["template"])
+    check("注释被剥离（重写为纯 JSON）", "//" not in io.open(p1, encoding="utf-8").read())
+    check("注释丢失在 stderr 明确告警", "注释" in err1 and "JSONC" in err1)
+    check("生成 1 个带时间戳备份", len(backups(d1)) == 1, f"({backups(d1)})")
+    check("备份与原始字节逐字节一致", read(os.path.join(d1, backups(d1)[0])) == base_cfg.encode("utf-8"))
+    check("stderr 记录备份路径", "backup" in err1 and backups(d1)[0] in err1)
+    check("顶层键顺序与内容保持（$schema 未凭空新增）", "$schema" not in j1)
+
+    # 同秒重复写入：备份文件名必须唯一，绝不覆盖
+    real_datetime = R.datetime
+
+    class _FixedDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime(2026, 1, 2, 3, 4, 5)
+
+    R.datetime = _FixedDatetime
+    try:
+        d2, p2 = new_cfg("same-second", base_cfg)
+        code2a, _, _ = run_reg(p2)
+        with open(p2, "wb") as fh:          # 复位成“需要改动”的状态
+            fh.write(base_cfg.encode("utf-8"))
+        code2b, _, _ = run_reg(p2)
+    finally:
+        R.datetime = real_datetime
+    b2 = backups(d2)
+    check("同秒两次写入都成功", (code2a, code2b) == (0, 0), f"({code2a},{code2b})")
+    check("同秒备份唯一、不覆盖", len(b2) == 2, f"({b2})")
+    check("第二个同秒备份带序号后缀", any(n.endswith("-1") for n in b2), f"({b2})")
+    check("两次备份内容都是原始字节",
+          all(read(os.path.join(d2, n)) == base_cfg.encode("utf-8") for n in b2))
+
+    # 解析失败：返回 3，原文件一字不动、不产生备份
+    d3, p3 = new_cfg("bad-json", "{ not valid json ")
+    before3 = read(p3)
+    code3, _, _ = run_reg(p3)
+    check("非法 JSON 返回 3", code3 == 3, f"(code={code3})")
+    check("解析失败时原文件不变", read(p3) == before3)
+    check("解析失败时不产生备份", backups(d3) == [])
+
+    # 配置 / 脚本不存在
+    code4, _, _ = run_reg(os.path.join(reg_root, "nope", "mimocode.jsonc"))
+    check("配置不存在返回 4", code4 == 4, f"(code={code4})")
+    code5, _, _ = run_reg(p1, script=os.path.join(reg_root, "missing_cli.py"))
+    check("脚本不存在返回 4", code5 == 4, f"(code={code5})")
+
+    # 无变化：返回 1，不重复写盘
+    code6, out6, _ = run_reg(p1)
+    check("重复注册返回 1", code6 == 1 and out6.strip() == "already-registered", f"(code={code6})")
+    check("无变化时不新增备份", len(backups(d1)) == 1)
+
+    # --no-backup
+    d7, p7 = new_cfg("no-backup", base_cfg)
+    code7, _, _ = run_reg(p7, extra=["--no-backup"])
+    check("--no-backup 不生成备份", code7 == 0 and backups(d7) == [], f"(code={code7})")
+
+    # 旧插件引用只在显式要求时才清理
+    d8, p8 = new_cfg("purge", base_cfg)
+    code8, _, _ = run_reg(p8, extra=["--purge-legacy-plugin"])
+    j8 = load(p8)
+    check("--purge-legacy-plugin 生效", code8 == 0 and j8["plugin"] == ["example-user-plugin.mjs"],
+          f"({j8.get('plugin')})")
+
+    # --uninstall：只删本项目命令，默认不动 plugin
+    code9, _, _ = run_reg(p1, extra=["--uninstall"])
+    j9 = load(p1)
+    check("--uninstall 返回 0", code9 == 0, f"(code={code9})")
+    check("--uninstall 移除本项目命令",
+          "usage" not in j9.get("command", {}) and "usage-open" not in j9.get("command", {}))
+    check("--uninstall 保留无关命令", j9["command"]["existing-command"]["template"] == "unchanged")
+    check("--uninstall 默认保留 plugin",
+          j9["plugin"] == ["usage-dashboard.mjs", "example-user-plugin.mjs"])
+
+    # BOM：原文件带 BOM 时写入后仍带 BOM
+    d10, p10 = new_cfg("bom", base_cfg, bom=True)
+    code10, _, _ = run_reg(p10)
+    check("带 BOM 的配置写入后仍保留 BOM", read(p10)[:3] == b"\xef\xbb\xbf", f"(code={code10})")
+    check("BOM 配置写入后可解析", load(p10)["command"]["usage"]["template"].startswith("用户请求查看"))
+
+    # 注释计数只统计字符串外的注释
+    check("注释计数忽略字符串内的 //",
+          R.jsonc_comment_count('{"u":"http://x","a":1}') == 0)
+    check("注释计数统计行注释与块注释",
+          R.jsonc_comment_count('{ // one\n /* two */ "a":1}') == 2)
+
     # ---- 收尾 ----
     try:
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
+        shutil.rmtree(reg_root, ignore_errors=True)
     except OSError:
         pass
 
