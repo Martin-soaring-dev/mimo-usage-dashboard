@@ -10,6 +10,8 @@ jobs:
   test:
     # MiMo Desktop 的目标用户环境是 Windows；优先在 Windows 验收路径、Python 调用和安装相关行为。
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
