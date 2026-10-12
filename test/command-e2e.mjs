@@ -95,23 +95,37 @@ if (!CAN_SPAWN) {
 } else {
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-e2e-"));
   const outFile = path.join(outDir, "usage.html");
-  // 直接执行脚本（等价于模板里的 shell 命令）
-  const stdout = runPy([SCRIPT, "--out", outFile]);
-  check("脚本产出 stdout", stdout.length > 0);
-  check("stdout 为简短一行", stdout.trim().split("\n").length === 1, `(${stdout.trim().length} 字符)`);
-  check("HTML 已生成", fs.existsSync(outFile));
-  const html = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : "";
-  check("HTML 自包含（无 fetch）", !/(^|[^a-zA-Z])fetch\(/.test(html));
-  check("HTML 内联数据", html.includes("var DATA"));
-  check("HTML 含重新生成按钮", html.includes('id="regen"'));
-  // 三块内容：data 里必有 kind，且 buildBody 会按 kind 渲染对应卡片。
-  // 断言「渲染函数齐备」而非「字面文案」，避免文案微调导致假失败。
-  check("HTML 三块渲染器齐备",
-    html.includes("function tokenCard") && html.includes("function sessionCard") && html.includes("function contextCard"));
-  check("HTML 含热力图渲染器", html.includes("function heatmapCard"));
-  check("HTML 含模型调用块渲染器", html.includes("function modelCard"));
-  check("HTML 含三块容器挂载点", html.includes('id="root"'));
-  fs.rmSync(outDir, { recursive: true, force: true });
+  const dbFile = path.join(outDir, "mimocode.db");
+  // 用与 Python 单元测试相同的 schema 创建临时数据库，不依赖测试机安装 MiMo。
+  const testDir = path.dirname(fileURLToPath(import.meta.url)).replace(/\\\\/g, "/");
+  const fixtureCode = [
+    "import sys, time",
+    `sys.path.insert(0, ${JSON.stringify(testDir)})`,
+    "from test_python import make_db",
+    "make_db(sys.argv[1], int(time.time() * 1000))",
+  ].join("\\n");
+  runPy(["-c", fixtureCode, dbFile]);
+  if (!CAN_SPAWN) {
+    fs.rmSync(outDir, { recursive: true, force: true });
+  } else {
+    check("临时测试数据库已创建", fs.existsSync(dbFile));
+    // 直接执行脚本并显式指定 fixture DB，不读取用户数据库。
+    const stdout = runPy([SCRIPT, "--db", dbFile, "--out", outFile]);
+    check("脚本产出 stdout", stdout.length > 0);
+    check("stdout 为简短一行", stdout.trim().split("\\n").length === 1, `(${stdout.trim().length} 字符)`);
+    check("HTML 已生成", fs.existsSync(outFile));
+    const html = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : "";
+    check("HTML 自包含（无 fetch）", !/(^|[^a-zA-Z])fetch\\(/.test(html));
+    check("HTML 内联数据", html.includes("var DATA"));
+    check("HTML 含重新生成按钮", html.includes('id="regen"'));
+    // 三块内容：data 里必有 kind，且 buildBody 会按 kind 渲染对应卡片。
+    check("HTML 三块渲染器齐备",
+      html.includes("function tokenCard") && html.includes("function sessionCard") && html.includes("function contextCard"));
+    check("HTML 含热力图渲染器", html.includes("function heatmapCard"));
+    check("HTML 含模型调用块渲染器", html.includes("function modelCard"));
+    check("HTML 含三块容器挂载点", html.includes('id="root"'));
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
 }
 
 console.log("\n=== 注入面检查 ===");
