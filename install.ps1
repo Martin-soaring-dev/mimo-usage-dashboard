@@ -1,4 +1,4 @@
-# Install MiMo Desktop Usage Dashboard (Python CLI + /usage command)
+﻿# Install MiMo Desktop Usage Dashboard (Python CLI + /usage command)
 # Usage:  powershell -ExecutionPolicy Bypass -File install.ps1
 #
 # 本脚本做两件事：
