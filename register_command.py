@@ -229,7 +229,7 @@ def main(argv=None) -> int:
 
     if not args.no_backup:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        shutil.copyfile(cfg_path, f"{cfg_path}.bak-{MARK}")
+        shutil.copyfile(cfg_path, f"{cfg_path}.bak-{MARK}-{stamp}")
 
     with open(cfg_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
