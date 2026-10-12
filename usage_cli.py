@@ -481,6 +481,9 @@ def card_data(db_path: str, kind: str = "all", days: int = 30,
                 "cacheRead": sum_["read"], "cacheWrite": sum_["write"],
                 "requests": sum_["requests"], "tools": sum_["tools"],
                 "cacheShare": (sum_["read"] / inp) if inp > 0 else 0.0,
+                # 与 session.total 用同一表达式：会话数是全量会话行数（不受 --days 影响），
+                # 这样 Token 视图的「会话数」与 Session 视图的「会话总数」不会漂移。
+                "sessions": len(data["sessions"]),
             },
             "totalsAll": data["totals"],
             "models": [{**m, "share": m["tokens"] / total_model} for m in mlist[:8]],

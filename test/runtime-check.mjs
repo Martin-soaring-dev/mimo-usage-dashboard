@@ -68,5 +68,38 @@ for (const [name, data] of cases) {
   }
 }
 
+// ---- 回归：Token 视图的「会话数」必须与 Session 视图的「会话总数」一致 ----
+// 之前 token.totals 里没有 sessions 字段，tokenCard 读 undefined -> fmtInt 渲染成 0。
+console.log("\n=== 会话数口径（回归） ===");
+const tokTotals = { tokens: 100, input: 10, output: 5, reasoning: 2, cacheRead: 80,
+                    cacheWrite: 0, requests: 3, tools: 4, cacheShare: .89, sessions: 3 };
+const tokenCase = { kind: "token",
+                    token: { totals: tokTotals, models: [], daily: [], recent: [], days: 30 } };
+const sessionCase = { kind: "session",
+                      session: { total: 3, top: [], totals: { tokens: 100, requests: 3, tools: 4 },
+                                 changes: 0, files: 0 } };
+const numOf = (html, label) => {
+  const m = html.match(new RegExp('<div class="num">([^<]*)</div><div class="lb">' + label + '</div>'));
+  return m ? m[1] : null;
+};
+try {
+  const tokenHtml = vm.runInContext(`buildBody(${JSON.stringify(tokenCase)})`, sandbox);
+  const sessionHtml = vm.runInContext(`buildBody(${JSON.stringify(sessionCase)})`, sandbox);
+  const tokenCount = numOf(tokenHtml, "会话数");
+  const sessionCount = numOf(sessionHtml, "会话总数");
+  check("Token 视图「会话数」渲染为 3（此前恒为 0）", tokenCount === "3", `(${tokenCount})`);
+  check("Token 会话数 == Session 会话总数", tokenCount === sessionCount,
+        `(${tokenCount} vs ${sessionCount})`);
+  // 缺失该字段时仍应退化为 0 而不是报错（向后兼容旧 DATA）
+  const legacy = { kind: "token",
+                   token: { totals: { ...tokTotals, sessions: undefined }, models: [], daily: [],
+                            recent: [], days: 30 } };
+  const legacyHtml = vm.runInContext(`buildBody(${JSON.stringify(legacy)})`, sandbox);
+  check("旧 DATA 缺 sessions 字段时不抛异常（渲染为 0）",
+        numOf(legacyHtml, "会话数") === "0", `(${numOf(legacyHtml, "会话数")})`);
+} catch (e) {
+  check("会话数口径渲染", false, e.message);
+}
+
 console.log(`\n${failures === 0 ? "RUNTIME CHECK OK" : "RUNTIME CHECK FAILED: " + failures}`);
 process.exit(failures === 0 ? 0 : 1);

@@ -189,6 +189,77 @@ def main() -> int:
     check("days 参数生效（3650 天覆盖全部）", d7["token"]["totals"]["tokens"] == 3500,
           f"({d7['token']['totals']['tokens']})")
 
+    # ---- 会话数口径（回归：Token 视图的「会话数」必须与 Session 视图的「会话总数」一致） ----
+    print("\n=== 会话数口径（回归） ===")
+    reg = U.card_data(db, kind="all")
+    check("Token 卡片含 sessions 字段（不再缺键渲染成 0）",
+          isinstance(reg["token"]["totals"].get("sessions"), int),
+          f"(sessions={reg['token']['totals'].get('sessions')!r})")
+    check("主数据：Token 会话数 == Session 会话总数",
+          reg["token"]["totals"].get("sessions") == reg["session"]["total"],
+          f"(token={reg['token']['totals'].get('sessions')}, session={reg['session']['total']})")
+
+    # 3 个会话
+    db3 = os.path.join(tmpdir, "three.db")
+    make_db(db3, now_ms)
+    c3 = sqlite3.connect(db3)
+    c3.execute("INSERT INTO session (id,title,directory,time_created,time_updated,"
+               "summary_additions,summary_deletions,summary_files) VALUES (?,?,?,?,?,?,?,?)",
+               ("s3", "第三个会话", "D:/proj", now_ms - 60_000, now_ms - 30_000, 1, 1, 1))
+    c3.commit()
+    c3.close()
+    for kind in ("all", "token", "session"):
+        d3 = U.card_data(db3, kind=kind)
+        # 注意：card_data 只为 token/all 输出 token 段、为 session/all 输出 session 段，
+        # 独立页面各带各的负载，所以按 kind 分别取用。
+        if "token" in d3:
+            n3 = d3["token"]["totals"].get("sessions")
+            check(f"3 会话 / {kind}：Token 会话数 = 3", n3 == 3, f"({n3})")
+        if "session" in d3:
+            check(f"3 会话 / {kind}：Session 总数 = 3", d3["session"]["total"] == 3,
+                  f"({d3['session']['total']})")
+        if "token" in d3 and "session" in d3:
+            check(f"3 会话 / {kind}：两视图一致",
+                  d3["token"]["totals"].get("sessions") == d3["session"]["total"] == 3,
+                  f"(token={d3['token']['totals'].get('sessions')}, session={d3['session']['total']})")
+
+    # 空数据集
+    db_empty = os.path.join(tmpdir, "empty.db")
+    make_db(db_empty, now_ms)
+    ce = sqlite3.connect(db_empty)
+    ce.executescript("DELETE FROM part; DELETE FROM message; DELETE FROM session;")
+    ce.commit()
+    ce.close()
+    de = U.card_data(db_empty, kind="all")
+    check("空数据集：Token 会话数 = 0",
+          de["token"]["totals"].get("sessions") == 0,
+          f"({de['token']['totals'].get('sessions')!r})")
+    check("空数据集：两视图一致且均为 0",
+          de["token"]["totals"].get("sessions") == de["session"]["total"] == 0,
+          f"(token={de['token']['totals'].get('sessions')}, session={de['session']['total']})")
+
+    # 缺失字段 / 异常字段：会话行本身仍是会话，计数按行数走且不崩
+    db_odd = os.path.join(tmpdir, "odd.db")
+    make_db(db_odd, now_ms)
+    co = sqlite3.connect(db_odd)
+    co.execute("INSERT INTO session (id,title,directory,time_created,time_updated) "
+               "VALUES (?,?,?,?,?)", ("s-null", "缺字段会话", "D:/proj", now_ms, now_ms))
+    for mid, raw in (("m-null", '{"role":"assistant"}'),
+                     ("m-onlytotal", '{"tokens":{"total":7}}'),
+                     ("m-badjson", '{ broken')):
+        co.execute("INSERT INTO message (id,session_id,time_created,time_updated,data) "
+                   "VALUES (?,?,?,?,?)", (mid, "s-null", now_ms, now_ms, raw))
+    co.commit()
+    co.close()
+    do = U.card_data(db_odd, kind="all")
+    check("缺失/异常字段：两视图一致且等于会话行数 3",
+          do["token"]["totals"].get("sessions") == do["session"]["total"] == 3,
+          f"(token={do['token']['totals'].get('sessions')}, session={do['session']['total']})")
+    check("缺失/异常字段：会话数不受缺 tokens / 非法 JSON 影响",
+          isinstance(do["token"]["totals"].get("sessions"), int)
+          and do["token"]["totals"]["sessions"] == len(U.read_usage(db_odd)["sessions"]),
+          f"(sessions={do['token']['totals'].get('sessions')})")
+
     # ---- 4. 注入防护 ----
     print("\n=== 参数白名单（注入防护） ===")
     check("拒绝分号拼接", U._sanitize_args(["token", ";", "rm", "-rf", "/"]) == ["token"])
