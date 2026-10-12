@@ -97,13 +97,13 @@ if (!CAN_SPAWN) {
   const outFile = path.join(outDir, "usage.html");
   const dbFile = path.join(outDir, "mimocode.db");
   // 用与 Python 单元测试相同的 schema 创建临时数据库，不依赖测试机安装 MiMo。
-  const testDir = path.dirname(fileURLToPath(import.meta.url)).replace(/\\/g, "/");
+  const testDir = path.dirname(fileURLToPath(import.meta.url)).split(path.sep).join("/");
   const fixtureCode = [
     "import sys, time",
     `sys.path.insert(0, ${JSON.stringify(testDir)})`,
     "from test_python import make_db",
     "make_db(sys.argv[1], int(time.time() * 1000))",
-  ].join("\n");
+  ].join(String.fromCharCode(10));
   runPy(["-c", fixtureCode, dbFile]);
   if (!CAN_SPAWN) {
     fs.rmSync(outDir, { recursive: true, force: true });
@@ -112,10 +112,10 @@ if (!CAN_SPAWN) {
     // 直接执行脚本并显式指定 fixture DB，不读取用户数据库。
     const stdout = runPy([SCRIPT, "--db", dbFile, "--out", outFile]);
     check("脚本产出 stdout", stdout.length > 0);
-    check("stdout 为简短一行", stdout.trim().split("\n").length === 1, `(${stdout.trim().length} 字符)`);
+    check("stdout 为简短一行", stdout.trim().split(String.fromCharCode(10)).length === 1, `(${stdout.trim().length} 字符)`);
     check("HTML 已生成", fs.existsSync(outFile));
     const html = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : "";
-    check("HTML 自包含（无 fetch）", !/(^|[^a-zA-Z])fetch\(/.test(html));
+    check("HTML 自包含（无 fetch）", !html.includes("fetch("));
     check("HTML 内联数据", html.includes("var DATA"));
     check("HTML 含重新生成按钮", html.includes('id="regen"'));
     // 三块内容：data 里必有 kind，且 buildBody 会按 kind 渲染对应卡片。
