@@ -56,8 +56,9 @@ try {
   if (-not (Test-Path -LiteralPath (Join-Path $legacy "keep.txt"))) {
     throw "Legacy files were unexpectedly deleted by default."
   }
-  if (-not (Test-Path -LiteralPath ($config + ".bak-mimo-usage-dashboard"))) {
-    throw "Expected configuration backup was not created."
+  $backups = @(Get-ChildItem -LiteralPath $configDir -Filter "mimocode.jsonc.bak-mimo-usage-dashboard-*")
+  if ($backups.Count -lt 1) {
+    throw "Expected timestamped configuration backup was not created."
   }
 
   Write-Host "WINDOWS INSTALL SMOKE TEST OK" -ForegroundColor Green
