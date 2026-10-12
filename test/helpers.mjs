@@ -30,7 +30,7 @@ export function stripJsonc(text) {
   return out.replace(/,(\s*[}\]])/g, "$1");
 }
 
-const q = (s) => (" " in s && !s.startsWith('"') ? `"${s}"` : s);
+const q = (s) => (s.includes(" ") && !s.startsWith('"') ? `"${s}"` : s);
 
 /** 与 register_command.py 的 build_usage_template 同构（仅用于形状断言）。 */
 export function buildUsageTemplate(py, script) {
