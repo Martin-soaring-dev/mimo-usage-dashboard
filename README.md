@@ -71,8 +71,13 @@ cd mimo-usage-dashboard
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-脚本会：把 CLI 拷到 `~/.config/mimocode/usage-dashboard/`，并把 `command.usage` /
-`command.usage-open` 写进 `mimocode.jsonc`，同时清理旧版遗留的技能与配置。
+如果本地 AI 已确认实际生效的配置文件不在默认位置，可显式指定路径：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -Config "C:\实际路径\mimocode.jsonc" -Python "C:\实际路径\python.exe"
+```
+
+也可用 `-InstallDir` 指定脚本安装目录。默认安装会备份配置，只更新本项目的 `/usage` 与 `/usage-open`，并保留旧版遗留文件；只有检查并确认后才显式使用 `-RemoveLegacy`。实机路径发现、安装提示词和验收流程见 [Windows 实机验收指南](./docs/windows-live-test-prompts.md)。
 
 安装后**彻底重启 MiMo Desktop**，再**新开一个会话**。
 
