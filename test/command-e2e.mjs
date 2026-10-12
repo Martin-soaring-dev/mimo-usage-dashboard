@@ -17,7 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { stripJsonc, buildUsageTemplate } from "./helpers.mjs";
+import { buildUsageTemplate } from "./helpers.mjs";
 
 const PY = process.env.MIMO_USAGE_PY
   || process.env.PYTHON
@@ -74,16 +74,9 @@ function runPy(args) {
 }
 
 console.log("=== 模板形状 ===");
-const cfgPath = path.join(os.homedir(), ".config", "mimocode", "mimocode.jsonc");
-let template;
-if (fs.existsSync(cfgPath)) {
-  const cfg = JSON.parse(stripJsonc(fs.readFileSync(cfgPath, "utf8")));
-  template = cfg?.command?.usage?.template;
-}
-if (!template) {
-  console.log("  (配置中未找到 command.usage，使用内存模板做形状校验)");
-  template = buildUsageTemplate(PY, SCRIPT);
-}
+// 测试始终使用独立内存模板；绝不读取或依赖开发者电脑上的真实 MiMo 配置。
+const template = buildUsageTemplate(PY, SCRIPT);
+console.log("  使用独立内存模板（不读取用户配置）");
 check("模板含且仅含 1 个 shell 命令", [...template.matchAll(SHELL_REGEX)].length === 1);
 check("shell 命令中不含裸 $1/$2 拼接", !/\$\d+/.test(template.split("!`")[1]?.split("`")[0] || ""));
 check("模板不透传用户参数到 shell", !template.includes("$ARGUMENTS") && !template.includes("--arg-string"));
