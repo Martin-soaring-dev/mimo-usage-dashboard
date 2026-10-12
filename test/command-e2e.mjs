@@ -21,7 +21,7 @@ import { stripJsonc, buildUsageTemplate } from "./helpers.mjs";
 
 const PY = process.env.MIMO_USAGE_PY
   || process.env.PYTHON
-  || "python";
+  || (process.platform === "win32" ? "python" : "python3");
 const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "usage_cli.py");
 
 let failures = 0;
@@ -61,8 +61,8 @@ let CAN_SPAWN = true;
 function runPy(args) {
   if (!CAN_SPAWN) return "";
   try {
-    // 经 cmd /c 包装调用，兼容 Windows 路径
-    return execFileSync("cmd", ["/c", PY, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    // 直接调用解释器，避免 cmd /c 仅适用于 Windows，确保 CI/Linux 可运行。
+    return execFileSync(PY, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (err) {
     if (err && (err.code === "EBUSY" || err.code === "EPERM" || err.code === "EACCES")) {
       CAN_SPAWN = false;
