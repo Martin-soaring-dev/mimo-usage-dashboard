@@ -19,8 +19,20 @@ template 里支持两类替换（引擎 src/config/markdown.ts）：
 用法：
     python register_command.py [--config <path>] [--python <exe>] [--script <path>]
     python register_command.py --uninstall
+    python register_command.py --purge-legacy-plugin
 
-退出码：0 成功 / 1 已存在（无变化） / 2 参数错误 / 3 解析失败 / 4 配置不存在
+行为约定：
+  * 只改本项目拥有的 ``command.usage`` / ``command.usage-open``；其它命令条目、
+    其它配置键、以及这两个条目上用户自行添加的字段（如 ``agent``）都原样保留。
+  * ``plugin`` 里指向旧版 ``usage-dashboard`` 的条目**默认保留**，只有显式传入
+    ``--purge-legacy-plugin`` 才会移除。
+  * 写入前先序列化候选内容并回读校验，再经同目录临时文件 ``os.replace`` 原子替换，
+    不会中途截断原配置。
+  * 备份文件名带时间戳且保证唯一（同秒重复时追加序号），绝不覆盖已有备份。
+  * JSONC 注释与原始排版**不会保留**：本脚本以规范化 JSON 重写文件。原文件在改动前
+    会逐字节备份，且检测到注释时会在 stderr 明确告警。
+
+退出码：0 成功 / 1 已存在（无变化） / 2 参数错误 / 3 解析失败 / 4 配置或脚本不存在 / 5 写入失败
 """
 
 from __future__ import annotations
@@ -31,6 +43,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from datetime import datetime
 
 MARK = "mimo-usage-dashboard"
@@ -85,6 +98,45 @@ def strip_jsonc(text: str) -> str:
 def load_jsonc(path: str) -> dict:
     raw = open(path, encoding="utf-8-sig").read()
     return json.loads(strip_jsonc(raw))
+
+
+def jsonc_comment_count(text: str) -> int:
+    """统计字符串字面量之外的 ``//`` 与 ``/* */`` 注释条数。
+
+    仅用于在重写前告诉用户注释不会被保留，不参与解析。
+    """
+    count = 0
+    i, n = 0, len(text)
+    in_str = False
+    quote = ""
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str, quote = True, ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            count += 1
+            while i < n and text[i] not in "\r\n":
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            count += 1
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        i += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +209,59 @@ def purge_legacy_plugins(cfg: dict) -> int:
     return removed
 
 
+def merge_command(existing, description: str, template: str) -> dict:
+    """覆盖本项目的 description/template，保留用户在该条目上添加的其它字段。"""
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged["description"] = description
+    merged["template"] = template
+    return merged
+
+
+def unique_backup_path(cfg_path: str) -> str:
+    """带时间戳的备份路径；同秒重复时追加序号，绝不覆盖已有备份。"""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"{cfg_path}.bak-{MARK}-{stamp}"
+    if not os.path.exists(base):
+        return base
+    n = 1
+    while True:
+        cand = f"{base}-{n}"
+        if not os.path.exists(cand):
+            return cand
+        n += 1
+
+
+def copy_exclusive(src: str, dst: str) -> None:
+    """复制到新文件；目标已存在则抛 FileExistsError，不覆盖任何已有备份。"""
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            with open(src, "rb") as inp:
+                shutil.copyfileobj(inp, out)
+    except BaseException:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        raise
+
+
+def write_atomically(path: str, text: str, encoding: str = "utf-8") -> None:
+    """同目录临时文件 + os.replace，避免失败时截断原文件。"""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".mimocode-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(prog="register_command.py",
@@ -167,6 +272,8 @@ def main(argv=None) -> int:
     parser.add_argument("--python", default=sys.executable, help="python 解释器路径")
     parser.add_argument("--uninstall", action="store_true", help="移除已注册的命令")
     parser.add_argument("--no-backup", action="store_true", help="不生成 .bak 备份")
+    parser.add_argument("--purge-legacy-plugin", action="store_true",
+                        help="额外移除 config 里指向旧版 usage-dashboard 插件的 plugin 条目（默认保留）")
     args = parser.parse_args(argv)
 
     cfg_path = os.path.abspath(args.config)
@@ -190,8 +297,8 @@ def main(argv=None) -> int:
 
     changed = False
 
-    # 无论安装还是卸载，都先摘掉旧插件引用（新设计不装插件）。
-    if purge_legacy_plugins(cfg):
+    # 旧插件引用默认保留；只有显式传入 --purge-legacy-plugin 时才摘除。
+    if args.purge_legacy_plugin and purge_legacy_plugins(cfg):
         changed = True
 
     if args.uninstall:
@@ -206,14 +313,16 @@ def main(argv=None) -> int:
             print(f"SCRIPT_NOT_FOUND {script}", file=sys.stderr)
             return 4
 
-        new_usage = {
-            "description": "MiMo Desktop 本机用量：生成静态 HTML 看板（Token / Session / 上下文）",
-            "template": build_usage_template(py, script),
-        }
-        new_open = {
-            "description": "MiMo Desktop 用量：生成并直接用浏览器打开静态看板",
-            "template": build_open_template(py, script),
-        }
+        new_usage = merge_command(
+            commands.get("usage"),
+            "MiMo Desktop 本机用量：生成静态 HTML 看板（Token / Session / 上下文）",
+            build_usage_template(py, script),
+        )
+        new_open = merge_command(
+            commands.get("usage-open"),
+            "MiMo Desktop 用量：生成并直接用浏览器打开静态看板",
+            build_open_template(py, script),
+        )
         if commands.get("usage") != new_usage:
             commands["usage"] = new_usage
             changed = True
@@ -227,12 +336,50 @@ def main(argv=None) -> int:
 
     cfg["command"] = commands
 
-    if not args.no_backup:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        shutil.copyfile(cfg_path, f"{cfg_path}.bak-{MARK}-{stamp}")
+    # 候选内容先序列化并回读校验，确认可解析且 command 段一致后才落盘。
+    candidate = json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
+    try:
+        reparsed = json.loads(candidate)
+    except ValueError as exc:
+        print(f"CANDIDATE_INVALID: {exc}", file=sys.stderr)
+        return 5
+    if reparsed.get("command") != commands:
+        print("CANDIDATE_INVALID: command 段与预期不一致", file=sys.stderr)
+        return 5
 
-    with open(cfg_path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+    raw = open(cfg_path, "rb").read()
+    comment_count = jsonc_comment_count(raw.decode("utf-8-sig", errors="replace"))
+
+    backup_path = None
+    if not args.no_backup:
+        backup_path = unique_backup_path(cfg_path)
+        try:
+            copy_exclusive(cfg_path, backup_path)
+            with open(backup_path, "rb") as fh:
+                if fh.read() != raw:
+                    print(f"BACKUP_VERIFY_FAILED {backup_path}", file=sys.stderr)
+                    return 5
+        except OSError as exc:
+            print(f"BACKUP_FAILED: {exc}", file=sys.stderr)
+            return 5
+
+    if backup_path:
+        print(f"backup    -> {backup_path}", file=sys.stderr)
+
+    if comment_count:
+        print(
+            f"WARNING: 原配置含 {comment_count} 处 JSONC 注释，"
+            f"重写后注释与原始排版不会保留（原始字节见上面的 backup 行）。",
+            file=sys.stderr,
+        )
+
+    # 原文件若带 UTF-8 BOM，则保持 BOM，避免给 PowerShell/编辑器带来意外变化。
+    encoding = "utf-8-sig" if raw[:3] == b"\xef\xbb\xbf" else "utf-8"
+    try:
+        write_atomically(cfg_path, candidate, encoding=encoding)
+    except OSError as exc:
+        print(f"WRITE_FAILED: {exc}", file=sys.stderr)
+        return 5
 
     print("unregistered" if args.uninstall else "registered")
     return 0

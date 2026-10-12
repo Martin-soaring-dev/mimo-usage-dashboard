@@ -77,7 +77,11 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 powershell -ExecutionPolicy Bypass -File install.ps1 -Config "C:\实际路径\mimocode.jsonc" -Python "C:\实际路径\python.exe"
 ```
 
-也可用 `-InstallDir` 指定脚本安装目录。默认安装会备份配置，只更新本项目的 `/usage` 与 `/usage-open`，并保留旧版遗留文件；只有检查并确认后才显式使用 `-RemoveLegacy`。实机路径发现、安装提示词和验收流程见 [Windows 实机验收指南](./docs/windows-live-test-prompts.md)。
+也可用 `-InstallDir` 指定脚本安装目录。默认安装会备份配置，只更新本项目的 `/usage` 与 `/usage-open`，并保留旧版遗留文件；只有检查并确认后才显式使用 `-RemoveLegacy`（它同时会移除配置里指向旧版 `usage-dashboard` 插件的 `plugin` 条目）。实机路径发现、安装提示词和验收流程见 [Windows 实机验收指南](./docs/windows-live-test-prompts.md)。
+
+失败即中止，不静默降级：显式指定的 `-Python` 不存在、或版本低于 3.10，都会直接报错而**不会**回退到其它解释器；自动探测到的解释器同样必须 ≥ 3.10；注册命令返回非零退出码时脚本立即中止，不会打印成功信息。
+
+配置重写的保留策略：`register_command.py` 用同目录临时文件 + `os.replace` 原子替换，只改本项目命令的 `description` / `template`，保留其它命令条目、这些条目上你自己加的字段（如 `agent`）以及 `plugin` 等其它配置键。**JSONC 注释与原始排版不会保留**；改动前会先写一份带时间戳的唯一备份（同秒重复时追加序号，绝不覆盖），并在 stderr 打印备份路径，检测到注释时额外告警。
 
 安装后**彻底重启 MiMo Desktop**，再**新开一个会话**。
 

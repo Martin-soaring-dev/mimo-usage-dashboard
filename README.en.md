@@ -65,7 +65,11 @@ By default it copies the CLI to `~/.config/mimocode/usage-dashboard/` and regist
 powershell -ExecutionPolicy Bypass -File install.ps1 -Config "C:\actual\path\mimocode.jsonc" -Python "C:\actual\path\python.exe"
 ```
 
-You can also pass `-InstallDir`. The installer backs up the config and preserves legacy files by default; only use `-RemoveLegacy` after reviewing them. For local path discovery and user-confirmed live acceptance, see [Windows live test guide](./docs/windows-live-test-prompts.md).
+You can also pass `-InstallDir`. The installer backs up the config and preserves legacy files by default; only use `-RemoveLegacy` after reviewing them (it also drops `plugin` entries that point at the old `usage-dashboard` plugin). For local path discovery and user-confirmed live acceptance, see [Windows live test guide](./docs/windows-live-test-prompts.md).
+
+Fail-closed by design: an explicit `-Python` that is missing or older than 3.10 aborts instead of falling back, every auto-detected interpreter must be ≥ 3.10, and a non-zero registration exit code aborts the install instead of printing success.
+
+Config rewrite policy: `register_command.py` replaces the file atomically (temp file in the same directory + `os.replace`) and touches only this project's `description` / `template`, preserving other commands, extra fields you added on those entries, and unrelated keys such as `plugin`. **JSONC comments and original formatting are not preserved**; a uniquely named timestamped backup is written first (a numeric suffix is added on same-second collisions, never overwriting) and its path is printed to stderr.
 
 Then **fully restart MiMo Desktop** and **open a new session**.
 
