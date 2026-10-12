@@ -19,6 +19,8 @@ jobs:
         with:
           node-version: 22
       - run: npm install
+      - name: Windows installer smoke test
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1
       - run: npm test
       - name: Package contents (dry run)
         run: npm pack --dry-run
