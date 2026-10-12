@@ -34,7 +34,7 @@ const q = (s) => (s.includes(" ") && !s.startsWith('"') ? `"${s}"` : s);
 
 /** 与 register_command.py 的 build_usage_template 同构（仅用于形状断言）。 */
 export function buildUsageTemplate(py, script) {
-  const cmd = `${q(py)} ${q(script)} --arg-string "$ARGUMENTS"`;
+  const cmd = `${q(py)} ${q(script)}`;
   return (
     "用户请求查看 MiMo Desktop 本机用量。下面一行是本地脚本的真实输出" +
     "（已生成好静态 HTML 页面，脚本零 AI 参与、纯离线）：\n\n" +
