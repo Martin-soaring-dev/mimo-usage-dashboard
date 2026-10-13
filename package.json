@@ -9,6 +9,7 @@
   "files": [
     "usage_cli.py",
     "register_command.py",
+    "installer.py",
     "install.ps1",
     "usage.cmd",
     "skill",
