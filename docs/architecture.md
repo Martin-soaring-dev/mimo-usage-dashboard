@@ -143,10 +143,13 @@ img-src data: blob:; font-src data:; connect-src 'none'
 - **流式占位**：`isSciWidget(lang) ? (streaming ? <Loading/> : <Iframe/>)`
   ⇒ 只要 HTML 由 AI 逐字输出，就会看到「正在生成交互演示…」
 
-### 4.3 结论
+### 4.3 结论（v0.3 页内刷新修订）
 
-放弃 `sci-widget` 与常驻服务，改为**静态 HTML 文件**：
-输出稳定、零 token、可反复打开、可归档、不占端口。
+静态 HTML 无法在页内重读 SQLite；宿主也没有「刷新已打开页面」的接口。因此：
+
+- `/usage` 仍生成**静态快照**（协议不变，stdout 一行路径）。
+- `--open` / `/usage-open` 会拉起**仅监听 127.0.0.1** 的只读服务（随机 path token、Host/Origin 校验、空闲退出），页面内「刷新数据」→ `GET /{token}/api/report` → 用新 JSON 重建 DOM。
+- API 只返回统计字段，不暴露数据库绝对路径；失败时页面保留上次成功数据。
 
 ## 5. 命令参数安全边界
 

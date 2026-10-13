@@ -23,6 +23,17 @@ jobs:
       - run: npm install
       - name: Windows installer smoke test
         run: powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1
+      # 安装器是可靠升级器：升级 / 失败回滚 / 混装检测 / 未知文件保留 /
+      # manifest 缺失时的 fail-closed / JSONC 原地修改保持注释 / 运行服务升级。
+      - name: Windows installer upgrade & rollback tests
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1
       - run: npm test
+      # UI 几何回归必须真实跑起来：--require-chrome 把「没有浏览器」变成显式失败（exit 1），
+      # 绝不允许缺依赖时静默 SKIP 却让 CI 显示绿色。windows-latest 镜像预装 Chrome/Edge，
+      # cdp.mjs 会依次探测 CHROME_PATH 与 Chrome/Edge 的标准安装路径。
+      - name: UI geometry tests (headless browser, required)
+        run: node test/ui-geometry.mjs --require-chrome
+      - name: Live refresh e2e (headless browser, required)
+        run: node test/refresh-e2e.mjs --require-chrome
       - name: Package contents (dry run)
         run: npm pack --dry-run

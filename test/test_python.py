@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """test_python.py — usage_cli.py 的端到端测试（纯 Python，无需 Node 子进程）
 
@@ -19,6 +19,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time as time_module
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -260,9 +261,9 @@ def main() -> int:
         d = U.card_data(db, kind=kind)
         html = U.render_html(d, cmd="python usage_cli.py", out_path="/tmp/x.html")
         check(f"{kind}: 完整 HTML", html.lstrip().lower().startswith("<!doctype html>"))
-        check(f"{kind}: 自包含（无 fetch）", "fetch(" not in html)
+        check(f"{kind}: 静态 LIVE=null", "var LIVE = null" in html)
         check(f"{kind}: 数据内联", "var DATA" in html)
-        check(f"{kind}: 有重新生成按钮", 'id="regen"' in html)
+        check(f"{kind}: 有刷新按钮", 'id="regen"' in html)
         if kind in ("token", "all"):
             check(f"{kind}: 含热力图渲染器", "function heatmapCard" in html)
             check(f"{kind}: 含模型调用块", "按模型的调用情况" in html)
@@ -285,6 +286,7 @@ def main() -> int:
             check(f"{kind}: 含最近会话表", "最近会话" in html)
         if kind in ("context", "all"):
             check(f"{kind}: 含上下文环", "上下文占用" in html)
+            check(f"{kind}: 运行时默认折叠分支", 'aria-expanded="' in html and "(open ? \"true\" : \"false\")" in html)
 
     # days 过滤
     d7 = U.card_data(db, kind="token", days=3650)
@@ -527,6 +529,26 @@ def main() -> int:
     check("丢弃未知 kind", U._sanitize_args(["hack"]) == [])
     check("--open 白名单放行", U._sanitize_args(["--open"]) == ["--open"])
 
+    # P0 回归（2026-10-14 真实部署暴露）：--help 曾被白名单**静默丢弃**，于是
+    # `usage_cli.py --help` 变成无参调用 —— 读了真实数据库、往用户数据目录写了报告，
+    # 还会在没有数据库的机器上让安装器的自检直接失败。三条断言把这条路封住。
+    check("--help 白名单放行（不再被静默丢弃）", U._sanitize_args(["--help"]) == ["--help"])
+    check("-h 白名单放行", U._sanitize_args(["-h"]) == ["-h"])
+    _dropped_flags = []
+    check("未知选项被丢弃时回传给调用方（便于报错而非静默变形）",
+          U._sanitize_args(["--bogus"], _dropped_flags) == [] and _dropped_flags == ["--bogus"],
+          f"(dropped={_dropped_flags})")
+    import contextlib as _cl
+    import io as _io_guard
+    _o_g, _e_g = _io_guard.StringIO(), _io_guard.StringIO()
+    try:
+        with _cl.redirect_stdout(_o_g), _cl.redirect_stderr(_e_g):
+            _guard_code = U.main(["--bogus"])
+    except SystemExit as _se:
+        _guard_code = _se.code
+    check("参数一个都没被识别时必须退出码 2（不静默按默认行为执行）",
+          _guard_code == 2, f"(code={_guard_code})")
+
     # ---- 5. JSONC 解析 ----
     print("\n=== JSONC 解析 ===")
     sample = """{
@@ -605,8 +627,17 @@ def main() -> int:
     check("plugin 默认保留", j1["plugin"] == ["usage-dashboard.mjs", "example-user-plugin.mjs"])
     check("顶层其它键保留", j1["mcp"] == {})
     check("模板不透传用户参数", "$ARGUMENTS" not in j1["command"]["usage"]["template"])
-    check("注释被剥离（重写为纯 JSON）", "//" not in io.open(p1, encoding="utf-8").read())
-    check("注释丢失在 stderr 明确告警", "注释" in err1 and "JSONC" in err1)
+    # Release Hardening：改为就地修改，注释与用户排版必须逐字节保留
+    raw1 = read(p1).decode("utf-8")
+    check("注释被保留（不再重写整个文件）", R.jsonc_comment_count(raw1) == 1, f"(count={R.jsonc_comment_count(raw1)})")
+    check("注释原文仍在文件里", "// 用户自己的注释" in raw1)
+    check("stderr 不再声称注释会丢失", "不会保留" not in err1)
+    check("command 段之前的字节完全未变",
+          base_cfg.split('"command"', 1)[0] == raw1.split('"command"', 1)[0])
+    check("command 段之后的字节完全未变",
+          base_cfg[base_cfg.rindex("}"):] == raw1[raw1.rindex("}"):])
+    check("mcp/plugin 行原文未变",
+          '"mcp": {}' in raw1 and '"plugin": ["usage-dashboard.mjs", "example-user-plugin.mjs"],' in raw1)
     check("生成 1 个带时间戳备份", len(backups(d1)) == 1, f"({backups(d1)})")
     check("备份与原始字节逐字节一致", read(os.path.join(d1, backups(d1)[0])) == base_cfg.encode("utf-8"))
     check("stderr 记录备份路径", "backup" in err1 and backups(d1)[0] in err1)
@@ -667,6 +698,15 @@ def main() -> int:
     check("--purge-legacy-plugin 生效", code8 == 0 and j8["plugin"] == ["example-user-plugin.mjs"],
           f"({j8.get('plugin')})")
 
+    # 只清理"明确属于本项目旧版"的条目：仅含同名子串的用户插件必须保留
+    d8b, p8b = new_cfg("purge-scoped",
+                       '{"command": {}, "plugin": ["my-usage-dashboard-helper.mjs", "usage-dashboard.mjs"]}\n')
+    code8b, _, _ = run_reg(p8b, extra=["--purge-legacy-plugin"])
+    j8b = load(p8b)
+    check("--purge-legacy-plugin 只删本项目旧插件",
+          code8b == 0 and j8b["plugin"] == ["my-usage-dashboard-helper.mjs"],
+          f"(code={code8b}, {j8b.get('plugin')})")
+
     # --uninstall：只删本项目命令，默认不动 plugin
     code9, _, _ = run_reg(p1, extra=["--uninstall"])
     j9 = load(p1)
@@ -688,6 +728,596 @@ def main() -> int:
           R.jsonc_comment_count('{"u":"http://x","a":1}') == 0)
     check("注释计数统计行注释与块注释",
           R.jsonc_comment_count('{ // one\n /* two */ "a":1}') == 2)
+
+    # ---- 7. Release Hardening：就地修改与 preflight（T5 / T6） ----
+    print("\n=== 就地修改（最小范围）与 preflight ===")
+
+    def masked_raw(text, keys):
+        """把指定顶层成员整段折叠掉，用于逐字节比较"其余部分是否原样"。"""
+        return R._without_members(text, set(keys))
+
+    def apply_and_compare(name, before_text, bom=False, newline="\n", keys=("command",)):
+        d, p = new_cfg(name, before_text, bom=bom)
+        if newline != "\n":
+            with open(p, "wb") as fh:
+                fh.write((("\ufeff" if bom else "") + before_text).replace("\n", newline).encode("utf-8"))
+        raw_before = read(p)
+        code, out, err = run_reg(p)
+        raw_after = read(p)
+        text_before = raw_before.decode("utf-8-sig")
+        text_after = raw_after.decode("utf-8-sig")
+        ok = (masked_raw(text_before, keys) == masked_raw(text_after, keys))
+        check(f"{name}: 除目标成员外逐字节未变", ok, f"(code={code})")
+        if not ok:
+            check(f"{name}: 差异",
+                  False, f"({masked_raw(text_before, keys)[:200]!r} != {masked_raw(text_after, keys)[:200]!r})")
+        return code, raw_before, raw_after, text_after
+
+    # T6：注释 / CRLF / BOM / 制表符缩进 / 嵌套 / 既有同名条目字段
+    t6 = (
+        "{\r\n"
+        "\t// 制表符缩进 + CRLF + 注释\r\n"
+        '\t"$schema": "https://x/s.json",\r\n'
+        '\t"command": {\r\n'
+        '\t\t/* 块注释 */\r\n'
+        '\t\t"other": { "description": "d", "template": "t", "agent": "keep" },\r\n'
+        '\t\t"usage": { "description": "用户自己写的", "template": "mine", "agent": "my-agent" }\r\n'
+        "\t},\r\n"
+        '\t"mcp": { "servers": { "a": { "url": "http://x" } } }\r\n'
+        "}\r\n"
+    )
+    code6, rb6, ra6, ta6 = apply_and_compare("t6-jsonc", t6, bom=True, newline="\r\n")
+    check("T6: 退出码 0", code6 == 0, f"(code={code6})")
+    check("T6: BOM 保留", ra6[:3] == b"\xef\xbb\xbf")
+    check("T6: CRLF 保留", b"\r\n" in ra6 and b"\n" not in ra6.replace(b"\r\n", b""))
+    check("T6: 制表符缩进保留", b"\t\t\"other\"" in ra6 or b"\t\t\"usage\"" in ra6)
+    check("T6: 行注释保留", "制表符缩进 + CRLF + 注释".encode("utf-8") in ra6)
+    check("T6: 块注释保留", b"/* \xe5\x9d\x97\xe6\xb3\xa8\xe9\x87\x8a */" in ra6)
+    check("T6: 嵌套 mcp 段逐字节保留", '"mcp": { "servers": { "a": { "url": "http://x" } } }'.encode() in ra6)
+    check("T6: 用户自加字段 agent 保留", '"agent": "my-agent"'.encode() in ra6)
+    check("T6: 邻居条目 agent 保留", '"agent": "keep"'.encode() in ra6)
+    j6 = json.loads(R.strip_jsonc(ta6))
+    check("T6: usage 描述已更新", j6["command"]["usage"]["description"].startswith("MiMo Desktop 本机用量"))
+    check("T6: usage-open 已插入", "usage-open" in j6["command"])
+
+    # 单行对象 / 无 command 段 / 空对象
+    apply_and_compare("inline", '{ "mcp": {}, "other": 1 }\n')
+    apply_and_compare("no-command", '{\n  // top\n  "mcp": {}\n}\n')
+    d_e, p_e = new_cfg("empty", "{}\n")
+    code_e, _, _ = run_reg(p_e)
+    je = load(p_e)
+    check("空对象配置也能注册", code_e == 0 and set(je["command"]) == {"usage", "usage-open"},
+          f"(code={code_e})")
+
+    # 无变化时不得新增备份、不得写盘
+    d_i, p_i = new_cfg("idem", '{\n  "command": {}\n}\n')
+    run_reg(p_i)
+    n_bak_1 = len(backups(d_i))
+    raw_i = read(p_i)
+    code_i, out_i, _ = run_reg(p_i)
+    check("重复注册返回 1", code_i == 1 and out_i.strip() == "already-registered", f"(code={code_i})")
+    check("重复注册不新增备份", len(backups(d_i)) == n_bak_1)
+    check("重复注册不改变字节", read(p_i) == raw_i)
+
+    # fail closed：重复键 / 非对象 / 无法定位 —— 必须退出码 6 或 3，且文件与备份都不变
+    print("\n--- fail closed（禁止猜测）---")
+    fc_cases = [
+        ("重复 command 键", '{"command": {}, "command": {}}\n'),
+        ("重复 usage 键", '{"command": {"usage": {}, "usage": {}}}\n'),
+        ("重复 usage-open 键", '{"command": {"usage-open": {}, "usage-open": {}}}\n'),
+        ("command 非对象", '{"command": "oops"}\n'),
+        ("command 是数组", '{"command": [1, 2]}\n'),
+        ("usage 非对象", '{"command": {"usage": "oops"}}\n'),
+        ("usage-open 非对象", '{"command": {"usage-open": 5}}\n'),
+        ("usage.template 是对象", '{"command": {"usage": {"template": {}}}}\n'),
+        ("usage.description 是数组", '{"command": {"usage": {"description": []}}}\n'),
+        ("重复 template 键", '{"command": {"usage": {"template": "a", "template": "b"}}}\n'),
+        ("字符串未闭合", '{"command": {"usage": "abc\n'),
+        ("块注释未闭合", '{"command": /* oops }\n'),
+        ("尾随多余内容", '{"command": {}} trailing\n'),
+        ("单引号字符串", "{'command': {}}\n"),
+        ("顶层不是对象", "[1, 2, 3]\n"),
+    ]
+    for name, text in fc_cases:
+        dfc, pfc = new_cfg("failclosed", text)
+        raw_before = read(pfc)
+        code_fc, _, err_fc = run_reg(pfc)
+        check(f"fail closed: {name}",
+              code_fc in (3, 6) and read(pfc) == raw_before and backups(dfc) == [],
+              f"(code={code_fc})")
+
+    # 校验器负向测试：人为构造"改动跑到目标区间外"必须被拦下
+    good = '{\n  "command": {},\n  "mcp": {}\n}\n'
+    bad = '{\n  "command": {},\n  "mcq": {}\n}\n'   # 偷偷改了 mcp 的键名
+    try:
+        R.verify_minimal_change(good, bad, ignore_top=set(), ignore_in_command={"usage", "usage-open"})
+        check("校验器拦下越界改动", False, "(未抛错)")
+    except R.JsoncStructureError:
+        check("校验器拦下越界改动", True)
+    try:
+        R.verify_minimal_change(good, good.replace('"mcp"', '"mcp2"'),
+                                ignore_top=set(), ignore_in_command=set())
+        check("校验器拦下 command 内非目标成员改动", False, "(未抛错)")
+    except R.JsoncStructureError:
+        check("校验器拦下 command 内非目标成员改动", True)
+
+    # preflight 报告（T5：manifest 缺失时的安全行为）
+    print("\n--- preflight 报告 ---")
+
+    def preflight(cfg_path, install_dir, extra=()):
+        out, err = io.StringIO(), io.StringIO()
+        old = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out, err
+        try:
+            code = R.main(["--preflight", "--config", cfg_path,
+                           "--install-dir", install_dir] + list(extra))
+        finally:
+            sys.stdout, sys.stderr = old
+        return code, json.loads(out.getvalue())
+
+    pf_root = tempfile.mkdtemp(prefix="preflight-", dir=reg_root)
+    pf_cfg = os.path.join(pf_root, "mimocode.jsonc")
+    pf_inst = os.path.join(pf_root, "installed")
+    os.makedirs(pf_inst)
+    with open(pf_cfg, "w", encoding="utf-8") as fh:
+        fh.write('{"command": {}}\n')
+
+    code_pf, rep_pf = preflight(pf_cfg, pf_inst)
+    check("T5: 全新环境 preflight 通过（码 0）", code_pf == 0, f"(code={code_pf})")
+    check("T5: mode=fresh", rep_pf["mode"] == "fresh")
+    check("T5: 管理文件全部 absent",
+          rep_pf["managedFiles"] == {"usage_cli.py": "absent", "register_command.py": "absent"})
+    check("T5: 全新环境不需要 -Force", rep_pf["requiresForce"] is False)
+
+    # 无 manifest 但含本项目标记 → 可平滑升级
+    with open(os.path.join(pf_inst, "usage_cli.py"), "w", encoding="utf-8") as fh:
+        fh.write("#!/usr/bin/env python3\n# " + R.OWNERSHIP_MARKER + "\n")
+    code_pf, rep_pf = preflight(pf_cfg, pf_inst)
+    check("T5: 含标记 → marker-only（认作本项目旧版）",
+          rep_pf["managedFiles"]["usage_cli.py"] == "marker-only")
+    check("T5: marker-only 不需 -Force", rep_pf["requiresForce"] is False, f"({rep_pf['forceReasons']})")
+    check("T5: mode=adopt", rep_pf["mode"] == "adopt")
+
+    # T5-b：无 manifest 且无标记 → 归属不明 → 必须要求显式确认
+    with open(os.path.join(pf_inst, "register_command.py"), "w", encoding="utf-8") as fh:
+        fh.write("# 用户自己的同名文件\n")
+    code_pf, rep_pf = preflight(pf_cfg, pf_inst)
+    check("T5: 无标记文件 → unknown", rep_pf["managedFiles"]["register_command.py"] == "unknown")
+    check("T5: unknown → preflight 退出码 7", code_pf == 7, f"(code={code_pf})")
+    check("T5: unknown → requiresForce", rep_pf["requiresForce"] is True)
+    check("T5: 说明归属不明的原因", any("归属不明" in r for r in rep_pf["forceReasons"]),
+          f"({rep_pf['forceReasons']})")
+    code_pf_force, rep_pf_force = preflight(pf_cfg, pf_inst, extra=("--force",))
+    check("T5: --force 后 preflight 通过", code_pf_force == 0, f"(code={code_pf_force})")
+
+    # manifest 记录哈希 → owned / owned-modified
+    import hashlib as _hl
+    _dg = _hl.sha256(open(os.path.join(pf_inst, "usage_cli.py"), "rb").read()).hexdigest()
+    with open(os.path.join(pf_inst, "install-manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump({"product": R.PRODUCT, "version": "0.2.0",
+                   "files": {"usage_cli.py": {"sha256": _dg}}}, fh)
+    code_pf, rep_pf = preflight(pf_cfg, pf_inst)
+    check("T5: manifest 匹配 → owned", rep_pf["managedFiles"]["usage_cli.py"] == "owned")
+    check("T5: manifestPresent=True", rep_pf["manifestPresent"] is True)
+    with open(os.path.join(pf_inst, "usage_cli.py"), "a", encoding="utf-8") as fh:
+        fh.write("# 用户改过这一行\n")
+    code_pf, rep_pf = preflight(pf_cfg, pf_inst)
+    check("T5: manifest 不匹配 → owned-modified", rep_pf["managedFiles"]["usage_cli.py"] == "owned-modified")
+    check("T5: owned-modified → 需要 -Force", rep_pf["requiresForce"] is True)
+    check("T5: 说明已被修改", any("已被修改" in r for r in rep_pf["forceReasons"]))
+
+    # 配置形态异常时 preflight 必须 fail closed
+    for name, text, want in (("重复 command", '{"command": {}, "command": {}}', 6),
+                             ("command 非对象", '{"command": 1}', 6),
+                             ("无法解析", '{ oops', 3)):
+        d_pf, p_pf = new_cfg("preflight-shape", text)
+        code_pf, rep_pf = preflight(p_pf, pf_inst)
+        check(f"preflight: {name} → 退出码 {want}", code_pf == want, f"(code={code_pf})")
+
+    # 存在指向别处的同名命令 → 认作他人注册，需要 -Force
+    d_pf2, p_pf2 = new_cfg("preflight-foreign",
+                           '{"command": {"usage": {"template": "echo hi"}}}\n')
+    code_pf, rep_pf = preflight(p_pf2, pf_inst)
+    check("preflight: 同名但非本项目命令 → 需要 -Force",
+          rep_pf["requiresForce"] is True and any("不指向本项目" in r for r in rep_pf["forceReasons"]),
+          f"({rep_pf['forceReasons']})")
+
+    # ---- 本地实时刷新服务（loopback） ----
+    print("\n=== 本地只读刷新服务 ===")
+    import threading as _th
+    import urllib.error as _uerr
+    import urllib.request as _ureq
+
+    data_dir = os.path.join(tmpdir, "usage-data")
+    os.makedirs(data_dir, exist_ok=True)
+    old_data_env = os.environ.get("MIMO_USAGE_DATA_DIR")
+    os.environ["MIMO_USAGE_DATA_DIR"] = data_dir
+    try:
+        # default_out_path 改为用户可写目录
+        check("default_out_path 落在数据目录而非 CWD",
+              os.path.abspath(U.default_out_path("all")).startswith(os.path.abspath(data_dir)),
+              f"({U.default_out_path('all')})")
+
+        # UTF-8 stdio：reconfigure 不可用时不抛异常
+        U.force_utf8_stdio()
+        check("force_utf8_stdio 对普通流安全", True)
+
+        # 管道/替换流
+        class _NoReconf:
+            def write(self, *_a, **_k):
+                return 0
+        import io as _io
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = _io.StringIO()
+        sys.stderr = _io.StringIO()
+        try:
+            U.force_utf8_stdio()
+            check("StringIO 无 reconfigure 时静默成功", True)
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+
+        payload0 = U.card_data(db, kind="all")
+        check("payload 含 dbPath（内部）", "dbPath" in payload0)
+        pub = U._public_payload(payload0)
+        check("公开 payload 不含 dbPath", "dbPath" not in pub)
+        check("公开 payload 有 dbLabel", bool(pub.get("dbLabel")))
+
+        httpd = U.create_usage_server(db, idle_minutes=10)
+        urls = U.live_urls(httpd)
+        check("服务仅绑定 127.0.0.1", httpd.server_address[0] in ("127.0.0.1", "::1"),
+              f"({httpd.server_address})")
+        t = _th.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        t.start()
+        try:
+            with _ureq.urlopen(urls["reportUrl"], timeout=3) as resp:
+                got = json.loads(resp.read().decode("utf-8"))
+            check("API 返回统计字段", all(k in got for k in ("kind", "token", "session", "context")))
+            check("API 不泄露 dbPath", "dbPath" not in got)
+
+            with _ureq.urlopen(urls["pageUrl"], timeout=3) as resp:
+                page = resp.read().decode("utf-8")
+            check("页面嵌入 LIVE.reportUrl", urls["reportUrl"] in page)
+            check("页面按钮为「刷新数据」", "刷新数据" in page)
+
+            # 错误 token → 404
+            bad = urls["reportUrl"].replace(urls["token"], "AAAAAAAAAAAAAAAAAAAAAA")
+            try:
+                _ureq.urlopen(bad, timeout=3)
+                check("错误 token 被拒绝", False)
+            except _uerr.HTTPError as e:
+                check("错误 token 被拒绝", e.code == 404, f"(code={e.code})")
+
+            # 不可信 Origin → 403
+            req = _ureq.Request(urls["reportUrl"], headers={"Origin": "http://evil.example"})
+            try:
+                _ureq.urlopen(req, timeout=3)
+                check("不可信 Origin 被拒绝", False)
+            except _uerr.HTTPError as e:
+                check("不可信 Origin 被拒绝", e.code == 403, f"(code={e.code})")
+
+            # 合法 Origin（同 loopback）允许
+            req_ok = _ureq.Request(urls["reportUrl"], headers={"Origin": f"http://127.0.0.1:{urls['port']}"})
+            with _ureq.urlopen(req_ok, timeout=3) as resp:
+                check("同源 loopback Origin 允许", resp.status == 200)
+
+            # ---- Origin / Host 安全边界（直接调用纯函数 + 真实 HTTP）----
+            check("Origin 缺失放行（同源导航/CLI）",
+                  U._origin_allowed(None, urls["port"]) is True)
+            check("Origin:null 被拒绝（沙箱 iframe / file://）",
+                  U._origin_allowed("null", urls["port"]) is False)
+            check("Origin:file:// 被拒绝",
+                  U._origin_allowed("file://", urls["port"]) is False)
+            check("Origin 省略端口被拒绝（防默认 80 口 CSRF）",
+                  U._origin_allowed("http://127.0.0.1", urls["port"]) is False)
+            check("Origin 端口不一致被拒绝",
+                  U._origin_allowed(f"http://127.0.0.1:{urls['port'] + 1}", urls["port"]) is False)
+            check("Origin:https 被拒绝",
+                  U._origin_allowed(f"https://127.0.0.1:{urls['port']}", urls["port"]) is False)
+            check("Origin 同端口 loopback 放行",
+                  U._origin_allowed(f"http://localhost:{urls['port']}", urls["port"]) is True)
+
+            # 真实 HTTP：Origin:null → 403
+            req_null = _ureq.Request(urls["reportUrl"], headers={"Origin": "null"})
+            try:
+                _ureq.urlopen(req_null, timeout=3)
+                check("HTTP Origin:null 被拒绝", False)
+            except _uerr.HTTPError as e:
+                check("HTTP Origin:null 被拒绝", e.code == 403, f"(code={e.code})")
+
+            # 真实 HTTP：非 loopback Host → 403（raw socket，绕过 urllib 重写 Host）
+            import socket as _sock
+            raw = _sock.create_connection(("127.0.0.1", urls["port"]), 2)
+            try:
+                path = f"/{urls['token']}/api/report"
+                raw.sendall(
+                    f"GET {path} HTTP/1.1\r\nHost: evil.example:{urls['port']}\r\n"
+                    f"Connection: close\r\n\r\n".encode("ascii")
+                )
+                resp_raw = b""
+                while True:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp_raw += chunk
+                check("非 loopback Host 被拒绝", b" 403 " in resp_raw.split(b"\r\n", 1)[0],
+                      f"({resp_raw.split(b'\\r\\n', 1)[0]!r})")
+            finally:
+                raw.close()
+
+            # 缺失 Host → 403
+            raw2 = _sock.create_connection(("127.0.0.1", urls["port"]), 2)
+            try:
+                path = f"/{urls['token']}/api/report"
+                raw2.sendall(f"GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n".encode("ascii"))
+                resp_raw = b""
+                while True:
+                    chunk = raw2.recv(4096)
+                    if not chunk:
+                        break
+                    resp_raw += chunk
+                check("缺失 Host 被拒绝", b" 403 " in resp_raw.split(b"\r\n", 1)[0])
+            finally:
+                raw2.close()
+
+            # shutdown 不接受跨源 Origin=null
+            req_sd_bad = _ureq.Request(
+                urls["reportUrl"].rsplit("/api/", 1)[0] + "/api/shutdown",
+                method="POST", data=b"", headers={"Origin": "null"},
+            )
+            try:
+                _ureq.urlopen(req_sd_bad, timeout=3)
+                check("Origin:null 的 shutdown 被拒绝", False)
+            except _uerr.HTTPError as e:
+                check("Origin:null 的 shutdown 被拒绝", e.code == 403, f"(code={e.code})")
+
+            # 数据变化后的 API 更新（真正动态刷新，不是旧 HTML 重载）
+            c = sqlite3.connect(db)
+            c.execute(
+                "INSERT INTO session (id,title,directory,time_created,time_updated,"
+                "summary_additions,summary_deletions,summary_files) VALUES (?,?,?,?,?,?,?,?)",
+                ("s-refresh", "刷新新增会话", "D:/proj", now_ms, now_ms + 1, 1, 1, 1),
+            )
+            c.commit()
+            c.close()
+            with _ureq.urlopen(urls["reportUrl"], timeout=3) as resp:
+                got2 = json.loads(resp.read().decode("utf-8"))
+            check("刷新后会话总数增加",
+                  got2["session"]["total"] >= got["session"]["total"] + 1,
+                  f"({got['session']['total']} → {got2['session']['total']})")
+
+            # 并发刷新：多个同时 GET 不应 500
+            codes = []
+            def _hit():
+                try:
+                    with _ureq.urlopen(urls["reportUrl"], timeout=5) as resp:
+                        codes.append(resp.status)
+                except Exception as ex:
+                    codes.append(str(ex))
+            threads = [_th.Thread(target=_hit) for _ in range(8)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=5)
+            check("并发刷新全部成功", len(codes) == 8 and all(c == 200 for c in codes), f"({codes})")
+
+            # shutdown
+            req_sd = _ureq.Request(urls["reportUrl"].rsplit("/api/", 1)[0] + "/api/shutdown", method="POST", data=b"")
+            with _ureq.urlopen(req_sd, timeout=3) as resp:
+                check("shutdown 接受请求", resp.status == 200)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            t.join(timeout=2)
+
+        # ---- db_missing：503 且不泄露绝对路径 ----
+        missing_db = os.path.join(tmpdir, "definitely-missing.db")
+        httpd_m = U.create_usage_server(missing_db, idle_minutes=10)
+        urls_m = U.live_urls(httpd_m)
+        tm = _th.Thread(target=httpd_m.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        tm.start()
+        try:
+            try:
+                _ureq.urlopen(urls_m["reportUrl"], timeout=3)
+                check("库缺失返回 503", False)
+            except _uerr.HTTPError as e:
+                body = e.read().decode("utf-8", "replace")
+                check("库缺失返回 503", e.code == 503, f"(code={e.code})")
+                check("503 响应不泄露数据库绝对路径",
+                      missing_db not in body and "definitely-missing" not in body, f"({body})")
+        finally:
+            httpd_m.shutdown()
+            httpd_m.server_close()
+            tm.join(timeout=2)
+
+        # ---- 启动锁：陈旧锁可被回收，当前锁可被释放 ----
+        lock = U._lock_path()
+        check("无锁时 acquire 成功", U._acquire_start_lock(timeout=1) is True)
+        check("已有锁时 acquire 超时失败", U._acquire_start_lock(timeout=0.2) is False)
+        U._release_start_lock()
+        check("release 后锁文件消失", not os.path.exists(lock))
+        # 陈旧锁（mtime 很旧）应被回收
+        os.makedirs(os.path.dirname(lock) or ".", exist_ok=True)
+        with open(lock, "w", encoding="utf-8") as fh:
+            fh.write("999999\n")
+        os.utime(lock, (0, 0))
+        check("陈旧锁可被回收并重新 acquire", U._acquire_start_lock(timeout=1) is True)
+        U._release_start_lock()
+
+        # 持有者已死的近期锁：不应等满 30s，应按 PID 存活回收
+        import subprocess as _sp
+        dead = _sp.Popen([sys.executable, "-c", "pass"])
+        dead.wait(timeout=10)
+        dead_pid = dead.pid
+        with open(lock, "w", encoding="utf-8") as fh:
+            fh.write(f"{dead_pid}\n")
+        # mtime 保持“刚刚写入”——只靠年龄不够，必须靠 PID 判死
+        got_dead = U._acquire_start_lock(timeout=2)
+        check("持有者已死的近期锁可被快速回收", got_dead is True)
+        if got_dead:
+            U._release_start_lock()
+
+        # ---- 真并发 --open：多进程同时 ensure_live_server，只允许一个健康实例 ----
+        print("\n=== 并发启动锁（多进程 ensure_live_server）===")
+        conc_data = os.path.join(tmpdir, "usage-data-conc")
+        os.makedirs(conc_data, exist_ok=True)
+        conc_db = os.path.join(tmpdir, "conc.db")
+        make_db(conc_db, int(time_module.time() * 1000))
+        worker = f"""
+import json, os, sys
+sys.path.insert(0, {json.dumps(ROOT)})
+import usage_cli as U
+live = U.ensure_live_server(sys.argv[1], idle_minutes=5)
+print(json.dumps(live, ensure_ascii=False))
+"""
+        conc_env = os.environ.copy()
+        conc_env["MIMO_USAGE_DATA_DIR"] = conc_data
+        # 父测试进程也切到同一数据目录，便于读 live-server.json / 清理
+        old_data_env_conc = os.environ.get("MIMO_USAGE_DATA_DIR")
+        os.environ["MIMO_USAGE_DATA_DIR"] = conc_data
+        try:
+            procs = [
+                _sp.Popen(
+                    [sys.executable, "-c", worker, conc_db],
+                    stdout=_sp.PIPE, stderr=_sp.PIPE,
+                    env=conc_env, text=True, encoding="utf-8", errors="replace",
+                )
+                for _ in range(4)
+            ]
+            outs = []
+            codes = []
+            for p in procs:
+                try:
+                    o, e = p.communicate(timeout=25)
+                except _sp.TimeoutExpired:
+                    p.kill()
+                    o, e = p.communicate(timeout=5)
+                    o = (o or "") + "\nTIMEOUT"
+                codes.append(p.returncode)
+                outs.append((o or "").strip())
+            check("4 个并发 ensure_live_server 均退出 0", all(c == 0 for c in codes), f"({codes})")
+            lives = []
+            for raw in outs:
+                line = next((ln for ln in raw.splitlines() if ln.startswith("{")), "")
+                try:
+                    lives.append(json.loads(line) if line else None)
+                except json.JSONDecodeError:
+                    lives.append(None)
+            check("4 个并发调用均拿到 live 对象", all(isinstance(x, dict) and x.get("token") for x in lives),
+                  f"({lives})")
+            tokens = {(x or {}).get("token") for x in lives}
+            ports = {(x or {}).get("port") for x in lives}
+            check("并发结果收敛到同一 token（无错配）", len(tokens) == 1 and None not in tokens, f"({tokens})")
+            check("并发结果收敛到同一 port", len(ports) == 1 and None not in ports, f"({ports})")
+            st_conc = U.read_server_state()
+            check("状态文件 token 与并发结果一致",
+                  bool(st_conc) and st_conc.get("token") in tokens
+                  and int(st_conc.get("port") or 0) in ports,
+                  f"(state={st_conc})")
+            live0 = next((x for x in lives if isinstance(x, dict)), None)
+            if live0:
+                try:
+                    with _ureq.urlopen(live0["reportUrl"], timeout=3) as resp:
+                        check("收敛后的唯一实例可访问 /api/report", resp.status == 200)
+                except Exception as ex:
+                    check("收敛后的唯一实例可访问 /api/report", False, f"({ex})")
+                # 只应有一个本库健康实例：再次并发 ensure 应全部复用同一 token
+                procs2 = [
+                    _sp.Popen(
+                        [sys.executable, "-c", worker, conc_db],
+                        stdout=_sp.PIPE, stderr=_sp.PIPE,
+                        env=conc_env, text=True, encoding="utf-8", errors="replace",
+                    )
+                    for _ in range(3)
+                ]
+                tokens2 = set()
+                reuse_ok = True
+                for p in procs2:
+                    try:
+                        o, _e = p.communicate(timeout=20)
+                    except _sp.TimeoutExpired:
+                        p.kill()
+                        o, _e = p.communicate(timeout=5)
+                        reuse_ok = False
+                    line = next((ln for ln in (o or "").splitlines() if ln.startswith("{")), "")
+                    try:
+                        obj = json.loads(line) if line else {}
+                    except json.JSONDecodeError:
+                        obj = {}
+                    tokens2.add(obj.get("token"))
+                    if p.returncode != 0 or not obj.get("reused"):
+                        reuse_ok = False
+                check("第二波并发全部复用同一实例（reused=true）",
+                      reuse_ok and tokens2 == tokens, f"(tokens={tokens2}, reused_ok={reuse_ok})")
+            # 清理：用状态文件里的 token 请求 shutdown，并验证身份后再清 state
+            try:
+                if st_conc and st_conc.get("token"):
+                    req_sd = _ureq.Request(
+                        f"http://{U.LOOPBACK_HOST}:{int(st_conc['port'])}/{st_conc['token']}/api/shutdown",
+                        method="POST", data=b"",
+                    )
+                    with _ureq.urlopen(req_sd, timeout=3) as resp:
+                        check("并发实例 shutdown 接受请求", resp.status == 200)
+                    time_module.sleep(0.3)
+                    st_after = U.read_server_state()
+                    check("shutdown 后状态文件已清理或 token 不再匹配",
+                          (st_after is None) or (st_after.get("token") != st_conc.get("token")),
+                          f"(after={st_after})")
+            except Exception as ex:
+                check("并发实例 shutdown 接受请求", False, f"({ex})")
+            finally:
+                U.clear_server_state()
+        finally:
+            if old_data_env_conc is None:
+                os.environ.pop("MIMO_USAGE_DATA_DIR", None)
+            else:
+                os.environ["MIMO_USAGE_DATA_DIR"] = old_data_env_conc
+    finally:
+        if old_data_env is None:
+            os.environ.pop("MIMO_USAGE_DATA_DIR", None)
+        else:
+            os.environ["MIMO_USAGE_DATA_DIR"] = old_data_env
+
+    # ---- P0 回归：selfcheck 必须零副作用（不读库、不写文件、无库也能通过）----
+    #  安装器用它验证"这份 usage_cli.py 能被目标解释器启动"，所以它绝不能有任何
+    #  副作用：不能建数据目录、不能写报告、没有数据库时也必须成功。
+    print("\n--- selfcheck（安装器自检用） ---")
+    import contextlib as _cl_sc
+    import io as _io_sc
+    _sc_dir = os.path.join(tmpdir, "selfcheck-data")
+    _old_dd = os.environ.get("MIMO_USAGE_DATA_DIR")
+    _old_db_sc = os.environ.get("MIMO_USAGE_DB")
+    os.environ["MIMO_USAGE_DATA_DIR"] = _sc_dir
+    os.environ["MIMO_USAGE_DB"] = os.path.join(tmpdir, "definitely-missing-selfcheck.db")
+    try:
+        _out_sc, _err_sc = _io_sc.StringIO(), _io_sc.StringIO()
+        with _cl_sc.redirect_stdout(_out_sc), _cl_sc.redirect_stderr(_err_sc):
+            _sc_code = U.main(["selfcheck"])
+        _sc = json.loads(_out_sc.getvalue())
+        check("selfcheck 返回 0（即使数据库不存在）", _sc_code == 0, f"(code={_sc_code})")
+        check("selfcheck 报告 supported 与 hasServer",
+              _sc.get("supported") is True and _sc.get("hasServer") is True)
+        check("selfcheck 如实报告数据库不存在", _sc.get("dbExists") is False)
+        check("selfcheck 不创建数据目录、不写任何文件", not os.path.exists(_sc_dir),
+              f"(dir_exists={os.path.exists(_sc_dir)})")
+
+        # 无参调用仍应正常生成报告（这是产品正常用法，与上面的"零副作用自检"是两条路）
+        _rep_dir = os.path.join(tmpdir, "selfcheck-report")
+        os.environ["MIMO_USAGE_DATA_DIR"] = _rep_dir
+        os.environ["MIMO_USAGE_DB"] = db
+        _out_r, _err_r = _io_sc.StringIO(), _io_sc.StringIO()
+        with _cl_sc.redirect_stdout(_out_r), _cl_sc.redirect_stderr(_err_r):
+            _rep_code = U.main([])
+        check("无参调用（产品正常用法）仍能生成报告", _rep_code == 0 and os.path.isdir(_rep_dir),
+              f"(code={_rep_code})")
+    finally:
+        if _old_dd is None:
+            os.environ.pop("MIMO_USAGE_DATA_DIR", None)
+        else:
+            os.environ["MIMO_USAGE_DATA_DIR"] = _old_dd
+        if _old_db_sc is None:
+            os.environ.pop("MIMO_USAGE_DB", None)
+        else:
+            os.environ["MIMO_USAGE_DB"] = _old_db_sc
 
     # ---- 收尾 ----
     try:

@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "mimo-usage-dashboard",
   "version": "0.2.0",
-  "description": "MiMo Desktop local usage dashboard — a zero-AI Python CLI that renders static HTML (token usage, cache hit rate, model share, session stats, context occupancy). No server, no ports, no network.",
+  "description": "MiMo Desktop local usage dashboard — a zero-AI Python CLI that renders HTML dashboards (token usage, cache hit rate, model share, session stats, context occupancy). Static snapshot by default; --open starts a loopback-only read-only refresh server.",
   "type": "module",
   "license": "MIT",
   "author": "Martin-soaring-dev",
@@ -13,7 +13,9 @@
     "usage.cmd",
     "skill",
     "docs",
-    "test",
+    "test/*.mjs",
+    "test/*.py",
+    "test/*.ps1",
     "README.md",
     "README.en.md",
     "LICENSE"
@@ -53,8 +55,11 @@
     "test:runtime": "node test/runtime-check.mjs",
     "test:ui-dom": "node test/ui-dom.mjs",
     "test:geometry": "node test/ui-geometry.mjs",
+    "test:refresh": "node test/refresh-e2e.mjs",
+    "test:install": "powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1",
+    "test:install-upgrade": "powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1",
     "test:live": "python test/e2e_live.py",
-    "test:all": "python test/test_python.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs && node test/ui-geometry.mjs && python test/e2e_live.py"
+    "test:all": "python test/test_python.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs && node test/ui-geometry.mjs && node test/refresh-e2e.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1 && python test/e2e_live.py"
   },
   "engines": {
     "python": ">=3.10"

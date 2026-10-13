@@ -53,6 +53,7 @@ function fakeEl(tag) {
     addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
     querySelector(sel) { return sel === ".tw" ? this._marker || null : null; },
     querySelectorAll() { return []; },
+    removeAttribute(k) { delete this.attrs[k]; },
     getBoundingClientRect() { return { left: 10, top: 20, right: 34, bottom: 44, width: 24, height: 24 }; },
     focus() { this.focused = true; },
     closest() { return null; },
@@ -354,10 +355,12 @@ section("UI-3 时间尺度：三窗口 / 切换刷新 / 兼容性 / 无网络");
       const h = render(sb, "token", tokenPayload(30), "999");
       return /最近 30 天/.test(h) && !h.includes(">undefined<");
     })());
-  check("切换窗口不引入任何取数/网络能力（运行时源码无 fetch/XHR/索引库/数据库 API）",
-    !/fetch\s*\(/.test(RUNTIME) && !/XMLHttpRequest/.test(RUNTIME)
-    && !/localStorage/.test(RUNTIME) && !/indexedDB/.test(RUNTIME)
-    && !/sqlite|readUsage|cardData/.test(RUNTIME));
+  check("时间尺度切换不引入网络 API；refreshData 内含真实 fetch",
+    /function refreshData\(\)/.test(RUNTIME)
+    && /fetch\s*\(/.test(RUNTIME.slice(RUNTIME.indexOf("function refreshData")))
+    && !/XMLHttpRequest/.test(RUNTIME)
+    && !/indexedDB/.test(RUNTIME)
+    && !/sqlite/.test(RUNTIME));
   check("切换窗口只走 renderTab（不重新读库、不重新生成 HTML）",
     /_WIN = wbtn.getAttribute\("data-win"\)/.test(py) && /renderTab\(_TAB, DATA\)/.test(py));
   // 生产实现里 _WIN 是粘性的：页面脚本切到 7 天后重绘别的视图，不应被打回默认窗口。
@@ -487,7 +490,12 @@ const treePayload = (branches) => ({
     && (html.match(/role="group"/g) || []).length === 4);
   check("分支行可聚焦并带 aria-expanded + aria-controls",
     rows.filter((r) => attrOf(r, "data-tree-toggle")).every((r) =>
-      attrOf(r, "tabindex") === "0" && attrOf(r, "aria-expanded") === "true" && !!attrOf(r, "aria-controls")));
+      attrOf(r, "tabindex") === "0" && attrOf(r, "aria-expanded") === "false" && !!attrOf(r, "aria-controls")));
+  check("分类树默认全部折叠（aria-expanded=false + 子项 hidden + ▸）",
+    rows.filter((r) => attrOf(r, "data-tree-toggle")).every((r) =>
+      attrOf(r, "aria-expanded") === "false")
+    && (html.match(/class="tkids"[^>]*\bhidden\b/g) || []).length === 4
+    && !/class="tw"[^>]*>▾</.test(html));
   check("三种单位分别标注", ["tokens", "次", "条"].every((u) => html.includes('data-unit="' + u + '"')));
   check("子项带 data-leaf/data-value 便于核对",
     (html.match(/data-leaf="/g) || []).length === branches.reduce((a, b) => a + b.children.length, 0));
@@ -495,7 +503,7 @@ const treePayload = (branches) => ({
   const buckets = [...html.matchAll(/data-tree-toggle="([^"]*)" data-branch="([^"]*)" data-unit="([^"]*)" data-total="(\d+)"/g)]
     .map((x) => ({ id: x[1], label: x[2], unit: x[3], total: Number(x[4]) }));
   const sumOf = (id) => {
-    const re = new RegExp('id="' + id + '" role="group">([\\s\\S]*?)(?=<div class="trow" role="treeitem" aria-level="1"|$)');
+    const re = new RegExp('id="' + id + '" role="group"(?: hidden)?>([\\s\\S]*?)(?=<div class="trow" role="treeitem" aria-level="1"|$)');
     const seg = (html.match(re) || [, ""])[1];
     return [...seg.matchAll(/data-value="(-?\d+)"/g)].reduce((a, x) => a + Number(x[1]), 0);
   };
@@ -547,22 +555,22 @@ const treePayload = (branches) => ({
   const byId = {};
   const sb = makeVm({ byId });
   const row = fakeEl("div");
-  row.attrs["aria-expanded"] = "true";
+  row.attrs["aria-expanded"] = "false";
   row.attrs["aria-controls"] = "tk-0";
   const marker = fakeEl("span");
-  marker.textContent = "▾";
+  marker.textContent = "▸";
   row._marker = marker;
   const kids = fakeEl("div");
-  kids.hidden = false;
+  kids.hidden = true;
   byId["tk-0"] = kids;
   sb.__row = row;
 
-  check("toggleTreeNode 折叠：aria-expanded=false + 子项隐藏 + 标记变 ▸",
-    call(sb, "toggleTreeNode(__row)") === false
-    && row.attrs["aria-expanded"] === "false" && kids.hidden === true && marker.textContent === "▸");
-  check("toggleTreeNode 展开：回到原状",
+  check("toggleTreeNode 展开：aria-expanded=true + 子项显示 + 标记变 ▾",
     call(sb, "toggleTreeNode(__row)") === true
     && row.attrs["aria-expanded"] === "true" && kids.hidden === false && marker.textContent === "▾");
+  check("toggleTreeNode 折叠：回到默认折叠状态",
+    call(sb, "toggleTreeNode(__row)") === false
+    && row.attrs["aria-expanded"] === "false" && kids.hidden === true && marker.textContent === "▸");
   check("toggleTreeNode 对 null / 缺 aria 的节点安全返回", call(sb, "toggleTreeNode(null)") === null);
 
   // 事件委托：click / keydown
@@ -580,15 +588,15 @@ const treePayload = (branches) => ({
     return prevented;
   };
   pressed("Enter");
-  check("键盘 Enter 折叠", row.attrs["aria-expanded"] === "false" && kids.hidden === true);
+  check("键盘 Enter 展开（默认折叠）", row.attrs["aria-expanded"] === "true" && kids.hidden === false);
   pressed(" ");
-  check("键盘 Space 展开", row.attrs["aria-expanded"] === "true" && kids.hidden === false);
+  check("键盘 Space 折叠", row.attrs["aria-expanded"] === "false" && kids.hidden === true);
   pressed("ArrowLeft");
-  check("键盘 ← 折叠", row.attrs["aria-expanded"] === "false");
+  check("键盘 ← 折叠（已折叠则不变）", row.attrs["aria-expanded"] === "false");
   pressed("ArrowLeft");
   check("已折叠时再按 ← 不变化", row.attrs["aria-expanded"] === "false");
   pressed("ArrowRight");
-  check("键盘 → 展开", row.attrs["aria-expanded"] === "true");
+  check("键盘 → 展开", row.attrs["aria-expanded"] === "true" && kids.hidden === false);
   pressed("ArrowRight");
   check("已展开时再按 → 不变化", row.attrs["aria-expanded"] === "true");
   const ignored = pressed("a");
@@ -641,8 +649,153 @@ section("全局：三视图 × 各类 payload 不抛异常、无 NaN/undefined")
     (() => { const h = build(sb, payloads["完整 all"]);
       return h.includes('role="tablist"') && h.includes('role="tabpanel"')
         && py.includes("renderTab(selected, DATA)") && py.includes('id="root"'); })());
-  check("生成期无外部资源引用（HTML 里没有 http(s)/script src/link href）",
-    !/https?:\/\//.test(py) && !/<script src/.test(py) && !/<link /.test(py));
+  check("生成期无外部资源引用（无 script src / link href；允许 loopback 模板）",
+    !/<script src/.test(py) && !/<link /.test(py)
+    && !/https?:\/\/(?!127\.0\.0\.1|localhost|\{LOOPBACK_HOST\})/.test(py));
+}
+
+// ===========================================================================
+section("实时刷新：fetch 更新数据 / 失败保留旧数据 / 并发闸门");
+// ===========================================================================
+{
+  const byId = {};
+  const root = fakeEl("div");
+  const regen = fakeEl("button");
+  const banner = fakeEl("div");
+  const last = fakeEl("span");
+  const sub = fakeEl("div");
+  byId.root = root;
+  byId.regen = regen;
+  byId["refresh-banner"] = banner;
+  byId["last-ok"] = last;
+  const sandbox = makeVm({ byId });
+  sandbox.LIVE = { reportUrl: "http://127.0.0.1:9/abc/api/report" };
+  sandbox.document.querySelector = (sel) => (sel === ".head .sub" ? sub : null);
+  let fetchCalls = 0;
+  let fetchOk = true;
+  let inflight = 0;
+  let maxInflight = 0;
+  sandbox.fetch = () => {
+    fetchCalls++;
+    inflight++;
+    maxInflight = Math.max(maxInflight, inflight);
+    return Promise.resolve().then(() => {
+      inflight--;
+      if (!fetchOk) return { ok: false, status: 503 };
+      return {
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({
+          kind: "all",
+          generatedAt: 2,
+          dbLabel: "mimocode.db",
+          token: { days: 30, totals: { tokens: 999, sessions: 2, requests: 3, tools: 1,
+            input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cacheShare: 0 },
+            models: [], daily: [], recent: [] },
+          session: { total: 2, totals: { tokens: 1, requests: 1, tools: 1 }, changes: 0, files: 0, top: [] },
+          context: { ok: false },
+        }),
+      };
+    });
+  };
+  sandbox.AbortController = class {
+    constructor() { this.signal = { aborted: false }; }
+    abort() { this.signal.aborted = true; }
+  };
+  sandbox.setTimeout = () => 0;
+  sandbox.clearTimeout = () => {};
+
+  sandbox.DATA = {
+    kind: "all",
+    token: { days: 30, totals: { tokens: 1, sessions: 1, requests: 1, tools: 0,
+      input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cacheShare: 0 },
+      models: [], daily: [], recent: [] },
+    session: { total: 1, totals: { tokens: 1, requests: 1, tools: 0 }, changes: 0, files: 0, top: [] },
+    context: { ok: false },
+    generatedAt: 1,
+    dbLabel: "mimocode.db",
+  };
+  sandbox._TAB = "token";
+  root.innerHTML = build(sandbox, sandbox.DATA);
+
+  const painted = call(sandbox, `__usagePaint({
+    kind: "token",
+    generatedAt: 2,
+    dbLabel: "mimocode.db",
+    token: { days: 30, totals: { tokens: 999, sessions: 2, requests: 3, tools: 1,
+      input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cacheShare: 0 },
+      models: [], daily: [], recent: [] },
+    session: { total: 2, totals: {}, changes: 0, files: 0, top: [] },
+    context: { ok: false }
+  })`);
+  check("paintData 返回 true 并更新 DATA.generatedAt",
+    painted === true && sandbox.DATA.generatedAt === 2);
+  check("paintData 更新 header 时间文案", /更新时间/.test(sub.textContent));
+
+  // 成功刷新
+  fetchOk = true;
+  fetchCalls = 0;
+  const ok1 = await call(sandbox, "__usageRefresh()");
+  check("成功刷新返回 true 且调用 fetch", ok1 === true && fetchCalls === 1);
+  check("成功后隐藏错误条", banner.hidden === true || banner.textContent === "");
+  check("按钮恢复可点击文案", regen.textContent === "刷新数据" && regen.disabled !== true);
+
+  // 失败刷新保留旧数据
+  const genBefore = sandbox.DATA.generatedAt;
+  const tokensBefore = sandbox.DATA.token.totals.tokens;
+  fetchOk = false;
+  const ok2 = await call(sandbox, "__usageRefresh()");
+  check("失败刷新返回 false", ok2 === false);
+  check("失败时保留上次成功数据",
+    sandbox.DATA.generatedAt === genBefore && sandbox.DATA.token.totals.tokens === tokensBefore);
+  check("失败时展示错误条", /刷新失败/.test(banner.textContent) && banner.hidden === false);
+
+  // 恢复
+  fetchOk = true;
+  const ok3 = await call(sandbox, "__usageRefresh()");
+  check("恢复后可再次刷新成功", ok3 === true && sandbox.DATA.token.totals.tokens === 999);
+
+  // 并发：第一次进行中时第二次应被闸门挡住
+  fetchCalls = 0;
+  maxInflight = 0;
+  let release;
+  sandbox.fetch = () => {
+    fetchCalls++;
+    inflight++;
+    maxInflight = Math.max(maxInflight, inflight);
+    return new Promise((resolve) => {
+      release = () => {
+        inflight--;
+        resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            kind: "token",
+            generatedAt: 3,
+            dbLabel: "mimocode.db",
+            token: { days: 30, totals: { tokens: 5, sessions: 1, requests: 1, tools: 0,
+              input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cacheShare: 0 },
+              models: [], daily: [], recent: [] },
+            session: { total: 1, totals: {}, changes: 0, files: 0, top: [] },
+            context: { ok: false },
+          }),
+        });
+      };
+    });
+  };
+  const pa = call(sandbox, "__usageRefresh()");
+  const pb = call(sandbox, "__usageRefresh()");
+  check("并发第二次立即短路（fetch 只发一次）", fetchCalls === 1);
+  release();
+  const [ra, rb] = await Promise.all([pa, pb]);
+  check("并发完成后仅第一次执行网络请求结果", ra === true && rb === false);
+
+  // 无 LIVE 配置时明确不可刷新
+  sandbox.LIVE = null;
+  fetchCalls = 0;
+  const offline = await call(sandbox, "__usageRefresh()");
+  check("无 LIVE 时不发请求并提示离线", offline === false && fetchCalls === 0
+    && /静态快照|实时/.test(banner.textContent));
 }
 
 console.log(`\n${failed === 0 ? "UI DOM OK" : "UI DOM FAILED: " + failed}`);

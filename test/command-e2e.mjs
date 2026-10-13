@@ -108,9 +108,11 @@ if (!CAN_SPAWN) {
     check("stdout 为简短一行", stdout.trim().split(String.fromCharCode(10)).length === 1, `(${stdout.trim().length} 字符)`);
     check("HTML 已生成", fs.existsSync(outFile));
     const html = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : "";
-    check("HTML 自包含（无 fetch）", !html.includes("fetch("));
+    // 静态路径：LIVE 必须是 null（无实时服务）；允许运行时含刷新函数定义，但不得启用。
+    check("静态 HTML 的 LIVE=null（未附着实时服务）", html.includes("var LIVE = null"));
     check("HTML 内联数据", html.includes("var DATA"));
-    check("HTML 含重新生成按钮", html.includes('id="regen"'));
+    check("HTML 含刷新按钮", html.includes('id="regen"'));
+    check("HTML 运行时默认折叠分类树", html.includes('(open ? "true" : "false")'));
     // 三块内容：data 里必有 kind，且 buildBody 会按 kind 渲染对应卡片。
     check("HTML 三块渲染器齐备",
       html.includes("function tokenCard") && html.includes("function sessionCard") && html.includes("function contextCard"));

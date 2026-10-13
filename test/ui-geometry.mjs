@@ -2,12 +2,18 @@
 //
 //   node test/ui-geometry.mjs            # 本机有 Chrome 时执行真实布局断言
 //   CHROME_PATH=/path/to/chrome node …   # 指定浏览器
+//   node test/ui-geometry.mjs --require-chrome   # 无浏览器时**必须失败**（CI 用）
 //   node test/ui-geometry.mjs --shots DIR  # 额外存几张截图（仅合成数据，可人工复核）
+//
+// 退出码（三态，缺浏览器绝不等于通过）：
+//   0 = PASS（真实浏览器跑完且全部断言通过）
+//   1 = FAIL（断言失败；或 --require-chrome 时找不到/起不来浏览器）
+//   2 = SKIP（未加 --require-chrome 且本机无可用浏览器——明确跳过，不是成功）
 //
 // 为什么单独一个文件、且不挂进 `npm test`：
 //   `npm test` 必须在没有浏览器的机器/CI 上也能确定性通过，而这里的断言**只能在真实
 //   布局引擎里做**（模拟 DOM 没有排版，量不出 offsetHeight / scrollWidth）。
-//   所以它自带 SKIP 降级，作为独立脚本运行、结果如实报告。
+//   本机手动运行允许 SKIP 降级；CI 必须加 --require-chrome，把缺依赖变成显式失败。
 //
 // 覆盖（对应 spec §7.2）：
 //   UI-1 12 个月在 1200/1000/900/820/720px 下完整可见且无横向溢出；<720px 才允许滚动
@@ -30,10 +36,11 @@ const ROOT = path.resolve(HERE, "..");
 const SCRIPT = path.join(ROOT, "usage_cli.py");
 const PY = process.env.MIMO_USAGE_PY || process.env.PYTHON
   || (process.platform === "win32" ? "python" : "python3");
+const REQUIRE_CHROME = process.argv.includes("--require-chrome");
 
-// 常规视口 + 边界：1200/1000/900/820/720 必须无溢出；1199 是「刚窄于 1200」的边界；
-// 719 是「刚窄于 720」，从这里开始才允许热力图内部横向滚动。
-const VIEWPORTS = [1200, 1000, 900, 820, 720, 1199, 719];
+// 常规视口 + 边界：≥720 必须无溢出；1093/768 是真实使用中出现过问题/常用宽度的抽样；
+// 1199 是「刚窄于 1200」的边界；719 是「刚窄于 720」，从这里开始才允许热力图内部横向滚动。
+const VIEWPORTS = [1200, 1093, 1000, 900, 820, 768, 720, 1199, 719];
 const NO_SCROLL_VIEWPORTS = VIEWPORTS.filter((w) => w >= 720);
 
 let failed = 0;
@@ -61,7 +68,7 @@ execFileSync(PY, [SCRIPT, "--db", dbFile, "--out", htmlFile], { stdio: ["ignore"
 
 const html = fs.readFileSync(htmlFile, "utf8");
 console.log("=== 静态（生成期）断言 ===");
-check("生成期 HTML 无 fetch(", !html.includes("fetch("));
+check("生成期 HTML 无外部资源引用；静态页 LIVE=null", !html.includes("var LIVE = {") && html.includes("var LIVE = null"));
 check("生成期 HTML 无 XMLHttpRequest", !html.includes("XMLHttpRequest"));
 check("生成期 HTML 无外部 http(s) 资源", !/https?:\/\//.test(html.replace(/https?:\/\/[^"]*json-schema\.org[^"]*/g, "")));
 
@@ -115,6 +122,7 @@ const PROBE = `(() => {
     viewportW: window.innerWidth,
     colsClient: q('.hm .cols') ? q('.hm .cols').clientWidth : -1,
     colsScroll: q('.hm .cols') ? q('.hm .cols').scrollWidth : -1,
+    colsOverflowX: q('.hm .cols') ? getComputedStyle(q('.hm .cols')).overflowX : '',
     docClient: docEl.clientWidth,
     docScroll: docEl.scrollWidth,
     cellCount: cells.length,
@@ -149,16 +157,33 @@ const PROBE = `(() => {
 })()`;
 
 const chrome = findChrome();
-if (!chrome) {
-  console.log("\n  SKIP  未找到可用 Chrome（可用 CHROME_PATH 指定）→ 跳过真实浏览器几何验证");
+
+// 缺依赖时的三态出口：--require-chrome（CI）→ FAIL(1)；否则明确 SKIP(2)，绝不静默成功。
+const bailNoBrowser = (reason) => {
+  try { fs.rmSync(work, { recursive: true, force: true }); } catch { /* ignore */ }
+  if (REQUIRE_CHROME) {
+    console.log(`\n  FAIL  --require-chrome：${reason}`);
+    console.log("\nUI GEOMETRY FAILED: 浏览器依赖缺失（不允许静默跳过）");
+    process.exit(1);
+  }
+  console.log(`\n  SKIP  ${reason}（未指定 --require-chrome，按 SKIP 处理）`);
   console.log("        注意：本文件的断言全部依赖真实布局引擎，模拟 DOM 无法替代。");
   console.log("\nUI GEOMETRY SKIPPED");
-  process.exit(0);
+  process.exit(2);
+};
+
+if (!chrome) {
+  bailNoBrowser("未找到可用 Chrome/Edge（可用 CHROME_PATH 指定）→ 跳过真实浏览器几何验证");
 }
 console.log(`\n=== 真实浏览器几何（${chrome}）===`);
 
-const page = await openPage({ width: 1200, height: 2600 });
-if (!page) { console.log("  SKIP  无法启动 Chrome"); process.exit(0); }
+let page = null;
+try {
+  page = await openPage({ width: 1200, height: 2600 });
+} catch (err) {
+  bailNoBrowser(`无法启动浏览器（${err && err.message}）→ 跳过真实浏览器几何验证`);
+}
+if (!page) bailNoBrowser("无法启动浏览器 → 跳过真实浏览器几何验证");
 
 const probes = {};
 try {
@@ -185,7 +210,13 @@ try {
     if (w >= 720) {
       check(`${w}px: .hm .cols 无横向溢出`, over === 0, `(client=${p.colsClient} scroll=${p.colsScroll} 溢出=${over})`);
     } else {
-      check(`${w}px: 允许横向滚动（<720px）`, over >= 0, `(client=${p.colsClient} scroll=${p.colsScroll} 溢出=${over})`);
+      // 窄屏（<720px）：媒体查询给出 JS 计算的 min-width，允许**并且预期**出现滚动区。
+      // 两条断言都必须有意义：
+      //   (a) 溢出确实发生 —— 证明 min-width 生效（否则 12 个月会被压扁成 0 宽而测不出来）；
+      //   (b) 溢出必须可滚动到达 —— overflow-x 必须是 auto/scroll，被 hidden/clip 裁掉 = 内容不可达。
+      check(`${w}px: 窄屏 min-width 生效（滚动区确实存在）`, over > 0, `(client=${p.colsClient} scroll=${p.colsScroll} 溢出=${over})`);
+      check(`${w}px: 溢出内容可滚动到达`, p.colsOverflowX === "auto" || p.colsOverflowX === "scroll",
+        `(overflow-x=${p.colsOverflowX})`);
     }
     check(`${w}px: 页面本身不出现横向滚动条`, p.docScroll - p.docClient <= 0,
       `(doc client=${p.docClient} scroll=${p.docScroll})`);
@@ -233,6 +264,29 @@ try {
   check("贴近视口右侧/顶部时提示层自动夹紧", !!lastCell && lastCell.exists
     && lastCell.left >= 0 && lastCell.right <= lastCell.vw + 1 && lastCell.top >= 0,
     lastCell ? `(l=${lastCell.left.toFixed(1)} r=${lastCell.right.toFixed(1)} t=${lastCell.top.toFixed(1)} vw=${lastCell.vw})` : "");
+
+  // 悬停**最右侧**格子：transform:scale 会把格子的变换盒子计入 .cols 的可滚动区域，
+  // 若超出容器右缘就会凭空多出横向滚动条（真实用户在数据最右端悬停时必现）。
+  // 这里把该行为钉死：任何视口下，悬停最右侧格子都不得让 .cols 出现横向溢出。
+  const rightBox = JSON.parse(await page.eval(
+    `(() => { const cells = document.querySelectorAll('.hm .cell');
+      const el = cells[cells.length - 1]; if (!el) return "null";
+      const r = el.getBoundingClientRect();
+      return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 }); })()`));
+  let hoverOver = null;
+  if (rightBox) {
+    await page.moveMouse(rightBox.x, rightBox.y);
+    hoverOver = JSON.parse(await page.eval(
+      `(() => { const c = document.querySelector('.hm .cols');
+        const last = document.querySelectorAll('.hm .cell');
+        const el = last[last.length - 1];
+        return JSON.stringify({ client: c.clientWidth, scroll: c.scrollWidth,
+          over: c.scrollWidth - c.clientWidth, hovered: el.matches(':hover') }); })()`));
+  }
+  check("悬停最右侧格子不触发 .cols 横向溢出",
+    !!hoverOver && hoverOver.hovered && hoverOver.over === 0,
+    hoverOver ? `(hovered=${hoverOver.hovered} client=${hoverOver.client} scroll=${hoverOver.scroll} 溢出=${hoverOver.over})` : "(no cell)");
+  await page.moveMouse(4, 4);
 
   // ---------- UI-2：星期标签对齐 ----------
   console.log("\n-- UI-2 星期标签对齐（偏差阈值 1px）--");
@@ -380,42 +434,43 @@ try {
   check("tokens / 次 / 条 三种单位分开标注",
     new Set(tree.map((b) => b.unit)).size === 3, `(${tree.map((b) => b.unit).join(",")})`);
   check("分支行可键盘聚焦（tabindex=0）", tree.every((b) => b.tabindex === "0"));
-  check("默认展开且子项可见", tree.every((b) => b.expanded === "true" && b.kidHidden === false));
+  check("默认全部折叠（aria-expanded=false + 子项 hidden）",
+    tree.every((b) => b.expanded === "false" && b.kidHidden === true));
   check("未知工具被显式归入「未知工具」",
     tree.some((b) => b.unit === "次" && b.leaves.some((l) => l.startsWith("未知工具="))),
     `(${(tree.find((b) => b.unit === "次") || {}).leaves?.join(", ")})`);
   check("无法细分的分类被如实列出",
     /系统提示词/.test(html) && /无法细分/.test(html) && /不存提示词各段落/.test(html));
 
-  // 鼠标折叠 / 展开
+  // 鼠标展开 / 折叠（默认折叠 → 点击展开）
   const toggleByClick = async () => JSON.parse(await page.eval(`(() => {
     const n = document.querySelector('[data-tree-toggle]');
     const kids = document.getElementById(n.getAttribute('aria-controls'));
     return JSON.stringify({ expanded: n.getAttribute('aria-expanded'), hidden: kids.hidden }); })()`));
   await page.eval(`(() => { document.querySelector('[data-tree-toggle]').click(); return true; })()`);
-  const collapsed = await toggleByClick();
-  check("点击分支行可折叠", collapsed.expanded === "false" && collapsed.hidden === true,
-    JSON.stringify(collapsed));
-  await page.eval(`(() => { document.querySelector('[data-tree-toggle]').click(); return true; })()`);
   const expanded = await toggleByClick();
-  check("再次点击可展开", expanded.expanded === "true" && expanded.hidden === false, JSON.stringify(expanded));
+  check("点击分支行可展开", expanded.expanded === "true" && expanded.hidden === false,
+    JSON.stringify(expanded));
+  await page.eval(`(() => { document.querySelector('[data-tree-toggle]').click(); return true; })()`);
+  const collapsed = await toggleByClick();
+  check("再次点击可折叠", collapsed.expanded === "false" && collapsed.hidden === true, JSON.stringify(collapsed));
 
-  // 键盘：Enter / Space / ← / →
+  // 键盘：Enter / Space / ← / →（从默认折叠状态开始）
   const focusFirst = () => page.eval(
     "(() => { const n = document.querySelector('[data-tree-toggle]'); n.focus(); return document.activeElement === n; })()");
   check("分支行可获得焦点", (await focusFirst()) === true);
   await page.pressKey("Enter", "Enter", 13);
   const kEnter = await toggleByClick();
-  check("键盘 Enter 折叠", kEnter.expanded === "false" && kEnter.hidden === true, JSON.stringify(kEnter));
+  check("键盘 Enter 展开（默认折叠）", kEnter.expanded === "true" && kEnter.hidden === false, JSON.stringify(kEnter));
   await page.pressKey(" ", "Space", 32);
   const kSpace = await toggleByClick();
-  check("键盘 Space 展开", kSpace.expanded === "true" && kSpace.hidden === false, JSON.stringify(kSpace));
-  await page.pressKey("ArrowLeft", "ArrowLeft", 37);
-  const kLeft = await toggleByClick();
-  check("键盘 ← 折叠", kLeft.expanded === "false" && kLeft.hidden === true, JSON.stringify(kLeft));
+  check("键盘 Space 折叠", kSpace.expanded === "false" && kSpace.hidden === true, JSON.stringify(kSpace));
   await page.pressKey("ArrowRight", "ArrowRight", 39);
   const kRight = await toggleByClick();
   check("键盘 → 展开", kRight.expanded === "true" && kRight.hidden === false, JSON.stringify(kRight));
+  await page.pressKey("ArrowLeft", "ArrowLeft", 37);
+  const kLeft = await toggleByClick();
+  check("键盘 ← 折叠", kLeft.expanded === "false" && kLeft.hidden === true, JSON.stringify(kLeft));
 
   // ---------- 全局 ----------
   console.log("\n-- 全局 --");

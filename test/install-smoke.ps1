@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) ("mimo-install-smoke-" + [guid]::NewGuid().ToString("N"))
@@ -7,8 +7,26 @@ $config = Join-Path $configDir "mimocode.jsonc"
 $installDir = Join-Path $temp "installed-dashboard"
 $python = (Get-Command python -ErrorAction Stop).Source
 
+# 配置是 JSONC（Release Hardening 后会保留注释），PowerShell 的 ConvertFrom-Json 解析不了它。
+# 借产品自己的解析器解析，顺带验证配置确实能被产品读取。
+function ConvertFrom-Jsonc {
+  param([string]$Path)
+  $code = "import sys, json; sys.path.insert(0, r'" + $root + "');" +
+          "import register_command as R;" +
+          "print(json.dumps(json.loads(R.strip_jsonc(open(sys.argv[1], encoding='utf-8-sig').read())), ensure_ascii=False))"
+  $out = & $python -c $code $Path
+  if ($LASTEXITCODE -ne 0 -or -not $out) { throw "配置无法被产品解析：$Path" }
+  return (($out | Out-String) | ConvertFrom-Json)
+}
+
 try {
   New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+  $synthDb = Join-Path $temp "synth.db"
+  $fixture = "import sys, time; sys.path.insert(0, r'" + $PSScriptRoot + "\'); from test_python import make_db; make_db(sys.argv[1], int(time.time()*1000))"
+  & $python -c $fixture $synthDb | Out-Null
+  # 测试全程隔离：连数据库也指向合成库，绝不读真实的 ~/.local/share/mimocode/mimocode.db
+  $env:MIMO_USAGE_DB = $synthDb
+
   @'
 {
   // Preserve unrelated user settings.
@@ -37,7 +55,7 @@ try {
     }
   }
 
-  $json = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json
+  $json = ConvertFrom-Jsonc -Path $config
   if (-not $json.command."existing-command") {
     throw "Unrelated command was removed."
   }
@@ -59,6 +77,52 @@ try {
   $backups = @(Get-ChildItem -LiteralPath $configDir -Filter "mimocode.jsonc.bak-mimo-usage-dashboard-*")
   if ($backups.Count -lt 1) {
     throw "Expected timestamped configuration backup was not created."
+  }
+
+  # Release Hardening：配置改为最小范围就地修改，注释与无关设置必须原样保留
+  $cfgText = [System.IO.File]::ReadAllText($config, [System.Text.Encoding]::UTF8)
+  if (-not $cfgText.Contains("// Preserve unrelated user settings.")) {
+    throw "In-place edit dropped the user's JSONC comment."
+  }
+
+  # 必须写入 install-manifest.json（用于区分本项目文件与用户未知文件）
+  $manifestPath = Join-Path $installDir "install-manifest.json"
+  if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw "install-manifest.json was not written."
+  }
+  $mf = ($(Get-Content -LiteralPath $manifestPath -Raw) | ConvertFrom-Json)
+  if ($mf.product -ne "mimo-usage-dashboard") {
+    throw "install-manifest.json has an unexpected product field."
+  }
+  foreach ($file in @("usage_cli.py", "register_command.py")) {
+    $rec = $mf.files.$file
+    if ($null -eq $rec -or -not $rec.sha256) {
+      throw "manifest is missing a sha256 record for $file"
+    }
+    $actual = (Get-FileHash -LiteralPath (Join-Path $installDir $file) -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($rec.sha256 -ne $actual) {
+      throw "manifest sha256 mismatch for $file"
+    }
+  }
+
+  # 归属不明 / 已被修改的文件必须拒绝覆盖（fail closed）
+  $guardDir = Join-Path $temp "guard-install"
+  $guardCfgDir = Join-Path $temp "guard-cfg"
+  New-Item -ItemType Directory -Force -Path $guardDir, $guardCfgDir | Out-Null
+  $guardCfg = Join-Path $guardCfgDir "mimocode.jsonc"
+  '{ "command": {} }' | Set-Content -LiteralPath $guardCfg -Encoding UTF8
+  "# a file that is NOT ours" | Set-Content -LiteralPath (Join-Path $guardDir "usage_cli.py") -Encoding UTF8
+  $guardRefused = $false
+  try {
+    & (Join-Path $root "install.ps1") -Config $guardCfg -InstallDir $guardDir -Python $python | Out-Null
+  } catch {
+    $guardRefused = $true
+  }
+  if (-not $guardRefused) {
+    throw "install.ps1 overwrote a file without an ownership marker (should have failed closed)."
+  }
+  if ((Get-Content -LiteralPath (Join-Path $guardDir "usage_cli.py") -Raw) -notmatch "NOT ours") {
+    throw "install.ps1 modified an unowned file."
   }
 
   # --- 失败必须中止：不能静默回退、也不能谎报成功 ---
@@ -123,6 +187,7 @@ try {
 
   Write-Host "WINDOWS INSTALL SMOKE TEST OK" -ForegroundColor Green
 } finally {
+  Remove-Item Env:\MIMO_USAGE_DB -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath $temp) {
     Remove-Item -LiteralPath $temp -Recurse -Force
   }

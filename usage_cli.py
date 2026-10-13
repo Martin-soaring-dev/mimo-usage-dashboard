@@ -1,11 +1,13 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """usage_cli.py — MiMo Desktop 本机用量统计（确定性本地命令，零 AI 参与）
 
-与旧版（Node 插件 + 常驻 HTTP 服务）不同，本脚本是**纯离线命令行程序**：
-  读库 → 聚合 → 填充自包含 HTML 模板 → 写出静态文件（可选打开浏览器）。
+默认路径是纯离线命令行程序：
+  读库 → 聚合 → 填充自包含 HTML 模板 → 写出 HTML（可选打开浏览器）。
 
-不启动任何服务、不监听任何端口、不联网、不写数据库。
+`--open` 会额外拉起**仅监听 127.0.0.1** 的极小只读服务，让已打开的页面可以
+点「刷新数据」重新读库并更新图表（无需回聊天窗重跑 /usage）。服务带随机
+path token、Host/Origin 校验、空闲自动退出；默认仍不联网、不写数据库。
 
 用法（通常由 MiMo 的 `command` 字段以 `` !`python usage_cli.py ...` `` 触发）：
 
@@ -14,11 +16,17 @@
     python usage_cli.py session         # 只生成 Session 用量页
     python usage_cli.py context         # 只生成上下文占用页
     python usage_cli.py token --days 7  # 最近 7 天
-    python usage_cli.py --open          # 生成后用默认浏览器打开
+    python usage_cli.py --open          # 启动/复用实时服务并用浏览器打开
     python usage_cli.py --out D:/x.html # 指定输出路径
+    python usage_cli.py --shutdown      # 关闭本机实时服务
+    python usage_cli.py service-check    # 只读报告实时服务身份（安装器 preflight 用）
 
-仅依赖 Python 标准库（sqlite3 / json / html / argparse）。
+仅依赖 Python 标准库（sqlite3 / json / html / argparse / http.server）。
 """
+
+# mimo-usage-dashboard:managed-file:v1
+# 上面这一行是"本项目拥有的安装文件"标记，供 install.ps1 在缺少 manifest 时判断归属。
+# 没有该标记且没有 manifest 记录的同名文件一律视为用户文件，安装器不会覆盖。
 
 from __future__ import annotations
 
@@ -26,16 +34,25 @@ import argparse
 import html as _html
 import json
 import os
+import re
+import secrets
 import sqlite3
+import subprocess
 import sys
+import threading
+import time
 import webbrowser
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 
-DEFAULT_PORT = 8790  # 仅为兼容旧配置保留，本脚本不再使用
+DEFAULT_PORT = 8790  # 旧版固定端口；新版一律用系统分配的临时端口（port=0），不再使用 8790
+LOOPBACK_HOST = "127.0.0.1"
+DEFAULT_IDLE_MINUTES = 240  # 无请求后自动退出，避免孤儿进程
 
 # 已知模型的上下文窗口（tokens）。取自 MiMo 引擎内置模型表；DB 内不存该值。
 # 匹配规则：精确 id 优先，其次最长前缀（处理 -0731 / -preview 等后缀变体）。
@@ -64,12 +81,41 @@ KIND_TITLE = {
 }
 
 
+def force_utf8_stdio() -> None:
+    """尽力把 stdout/stderr 切到 UTF-8（Windows 默认 GBK/CP936 下中文会乱码）。
+
+    不能只依赖 ``PYTHONUTF8=1``：MiMo 的 shell 替换、管道捕获与子进程不一定带上。
+    对不支持 ``reconfigure`` 的流（StringIO、已被包装的测试流等）静默跳过，
+    **绝不改变退出码语义**，也不把异常抛给调用方。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def default_db_path() -> str:
     """数据源：~/.local/share/mimocode/mimocode.db（可用 MIMO_USAGE_DB 覆盖）。"""
     env = os.environ.get("MIMO_USAGE_DB")
     if env:
         return env
     return os.path.join(os.path.expanduser("~"), ".local", "share", "mimocode", "mimocode.db")
+
+
+def default_data_dir() -> str:
+    """用户可写数据目录。避免把报告默认写进 MiMo 安装目录 / Program Files。"""
+    env = os.environ.get("MIMO_USAGE_DATA_DIR")
+    if env:
+        return env
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "mimo-usage-dashboard")
 
 
 def model_context_limit(model_id: str | None) -> int | None:
@@ -712,7 +758,10 @@ h3{font-size:12px;margin:0 0 10px;font-weight:650;color:var(--muted);letter-spac
    只有视口 <720px 时才由媒体查询给出最小宽度并允许横向滚动（UI-1）。 */
 .hm{margin:2px 0 0}
 .hm .cols{overflow-x:auto;overflow-y:hidden}
-.hm .hm-grid{display:grid;gap:var(--gap);min-width:0}
+/* margin 是悬停呼吸空间：cell:hover 的 transform:scale 会把变换盒子计入 .cols 的
+   可滚动区域，最右侧格子放大会超出容器右缘 ~2.3px，凭空多出横向滚动条。
+   左右各留 4px 后，任何视口下悬停边缘格子都不再触发滚动条。 */
+.hm .hm-grid{display:grid;gap:var(--gap);min-width:0;margin:0 4px}
 .hm .mcell{grid-row:1;white-space:nowrap;overflow:hidden;color:var(--muted);font-size:9.5px;line-height:14px}
 .hm .dlbl{grid-column:1;align-self:center;justify-self:center;color:var(--muted);
   font-size:9px;line-height:1}
@@ -1172,15 +1221,16 @@ function sessionCard(s){
 // 只展示数据库里真实存在、可逐项核对的字段。单位不同的分支分开标注（tokens / 次 / 条），
 // 不把输入 token、缓存读取 token、输出 token、请求次数或会话数混为一谈，也不做任何
 // 「按比例分摊」的猜测；库中还原不出来的分类明确列出并说明原因。
-function treeKids(branch, path){
+function treeKids(branch, path, collapsed){
   var kids = (branch && branch.children) || [];
   var total = num(branch && branch.total);
   var unit = String((branch && branch.unit) || "");
+  var hid = collapsed ? " hidden" : "";
   if (!kids.length){
-    return '<div class="tkids" id="' + path + '" role="group">' +
+    return '<div class="tkids" id="' + path + '" role="group"' + hid + '>' +
       '<div class="tnote">（无可细分的子项）</div></div>';
   }
-  return '<div class="tkids" id="' + path + '" role="group">' + kids.map(function(c){
+  return '<div class="tkids" id="' + path + '" role="group"' + hid + '>' + kids.map(function(c){
     var v = num(c && c.value);
     return '<div class="trow tchild" role="treeitem" aria-level="2" data-leaf="' +
         esc(c && c.label) + '" data-value="' + v + '">' +
@@ -1199,16 +1249,18 @@ function contextTree(bd){
   var rows = branches.map(function(b, i){
     var path = "tk-" + i;
     var kids = (b && b.children) || [];
-    return '<div class="trow" role="treeitem" aria-level="1" aria-expanded="true"' +
+    var open = kids.length > 0 ? false : false; // 默认全部折叠（含无子项分支），保证 a11y 一致
+    var mark = kids.length ? (open ? "▾" : "▸") : "·";
+    return '<div class="trow" role="treeitem" aria-level="1" aria-expanded="' + (open ? "true" : "false") + '"' +
         ' aria-controls="' + path + '" tabindex="0" data-tree-toggle="' + path + '"' +
         ' data-branch="' + esc(b.label) + '" data-unit="' + esc(b.unit) +
         '" data-total="' + num(b.total) + '">' +
-      '<span class="tw" aria-hidden="true">' + (kids.length ? "▾" : "·") + '</span>' +
+      '<span class="tw" aria-hidden="true">' + mark + '</span>' +
       '<span class="tl">' + esc(b.label) + '</span>' +
       '<span class="tu muted small">' + esc(b.unit) + '</span>' +
       '<span class="tv">' + fmt(b.total) + '</span></div>' +
       '<div class="tnote">' + esc(b.note) + '</div>' +
-      treeKids(b, path);
+      treeKids(b, path, !open);
   }).join("");
   var na = (bd && bd.notSubdividable) || {};
   var labels = (na.labels || []).map(function(x){ return esc(x); }).join(" / ");
@@ -1341,26 +1393,135 @@ function buildBody(data){
 }
 
 function footer(data){
-  return '<div class="foot"><span>MiMo Desktop 本机统计 · 数据不出网 · 无服务、零 AI</span><span>生成于 ' +
-    new Date(data.generatedAt || Date.now()).toLocaleString("zh-CN", { hour12: false }) + '</span></div>';
+  var gen = new Date(data.generatedAt || Date.now()).toLocaleString("zh-CN", { hour12: false });
+  var live = (typeof LIVE !== "undefined" && LIVE) ? LIVE.reportUrl : "";
+  var stamp = '<span id="last-ok">最近成功更新：' + gen + '</span>';
+  var mode = live
+    ? '<span class="muted" id="live-mode">实时模式 · 可点击右上角刷新</span>'
+    : '<span class="muted" id="live-mode">静态快照 · 无页内刷新服务</span>';
+  return '<div class="foot"><span>MiMo Desktop 本机统计 · 数据不出网 · 仅本地只读' +
+    (live ? ' · loopback' : '') + '</span>' + mode + stamp + '</div>';
 }
+
+// ---- 页内刷新（仅当页面由本地只读服务携带 LIVE 配置时可用）----
+// 刷新语义：fetch 最新 card_data JSON → 整页重建 tab/图表 DOM。
+// 失败时**保留上次成功数据**，只显示错误条，绝不假装成功。
+var _REFRESHING = false;
+function showRefreshBanner(msg, isErr){
+  var el = document.getElementById("refresh-banner");
+  if (!el) return;
+  if (!msg){ el.hidden = true; el.textContent = ""; el.className = "tip"; return; }
+  el.hidden = false;
+  el.textContent = msg;
+  el.className = isErr ? "err" : "tip";
+}
+function paintData(next){
+  if (!next || typeof next !== "object") throw new Error("空数据");
+  DATA = next;
+  if (DATA.kind && DATA.kind !== "all") _TAB = DATA.kind;
+  var sub = document.querySelector(".head .sub");
+  if (sub){
+    var gen = new Date(DATA.generatedAt || Date.now()).toLocaleString("zh-CN", { hour12: false });
+    sub.textContent = "更新时间 " + gen + " · 数据源 " + (DATA.dbLabel || "mimocode.db");
+  }
+  var rootEl = document.getElementById("root");
+  if (!rootEl) throw new Error("缺少 #root");
+  rootEl.innerHTML = buildBody(DATA) + footer(DATA);
+  wireHeatmap(rootEl);
+  wireTree(rootEl);
+  var last = document.getElementById("last-ok");
+  if (last){
+    last.textContent = "最近成功更新：" +
+      new Date(DATA.generatedAt || Date.now()).toLocaleString("zh-CN", { hour12: false });
+  }
+  return true;
+}
+function refreshData(){
+  if (_REFRESHING) return Promise.resolve(false);
+  var btn = document.getElementById("regen");
+  var url = (typeof LIVE !== "undefined" && LIVE && LIVE.reportUrl) ? LIVE.reportUrl : "";
+  if (!url){
+    showRefreshBanner("当前页面没有连接本地刷新服务（静态快照）。请用 /usage-open 或 python usage_cli.py --open 打开实时看板。", true);
+    return Promise.resolve(false);
+  }
+  _REFRESHING = true;
+  if (btn){ btn.disabled = true; btn.textContent = "刷新中…"; btn.setAttribute("aria-busy", "true"); }
+  showRefreshBanner("正在读取最新用量…", false);
+  var ctl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  var timer = setTimeout(function(){ try { if (ctl) ctl.abort(); } catch (e) {} }, 8000);
+  return fetch(url, {
+    method: "GET",
+    cache: "no-store",
+    credentials: "omit",
+    signal: ctl ? ctl.signal : undefined
+  }).then(function(res){
+    clearTimeout(timer);
+    if (!res || !res.ok) throw new Error("HTTP " + (res ? res.status : 0));
+    return res.json();
+  }).then(function(json){
+    paintData(json);
+    showRefreshBanner("", false);
+    var st = document.getElementById("refresh-status");
+    if (st) st.textContent = "";
+    return true;
+  }).catch(function(err){
+    clearTimeout(timer);
+    var msg = "刷新失败：无法连接本地统计服务或请求超时。已保留上一次成功的数据。";
+    if (err && err.message && err.message !== "HTTP 0") msg += "（" + err.message + "）";
+    showRefreshBanner(msg + " 可稍后重试；若服务已退出，请重新运行 --open。", true);
+    return false;
+  }).then(function(ok){
+    _REFRESHING = false;
+    if (btn){ btn.disabled = false; btn.textContent = "刷新数据"; btn.removeAttribute("aria-busy"); }
+    return ok;
+  });
+}
+// 暴露给自动化测试（真实浏览器与 jsdom 均可用）
+try {
+  if (typeof globalThis !== "undefined") {
+    globalThis.__usageRefresh = refreshData;
+    globalThis.__usagePaint = paintData;
+    // 只读快照：CDP/e2e 无法直接读 IIFE 内的 DATA/LIVE
+    globalThis.__usageSnapshot = function(){
+      return { data: DATA, live: LIVE, tab: _TAB, refreshing: _REFRESHING };
+    };
+  }
+} catch (e) { /* file:// 下也可能可用；失败可忽略 */ }
 """
 
 
-def render_html(data: dict, *, cmd: str = "", out_path: str = "") -> str:
-    safe = (json.dumps(data, ensure_ascii=False)
-            .replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
-    kind = data.get("kind", "all")
-    title = _html.escape(KIND_TITLE.get(kind, "MiMo Desktop 用量"))
-    gen = datetime.fromtimestamp((data.get("generatedAt") or 0) / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
-    cmd_esc = _html.escape(cmd)
+def _public_payload(data: dict) -> dict:
+    """给网页/API 用的脱敏副本：不暴露数据库绝对路径等内部信息。"""
+    out = json.loads(json.dumps(data, ensure_ascii=False))
+    db_path = out.pop("dbPath", "") or ""
+    out["dbLabel"] = os.path.basename(db_path.replace("\\", "/")) if db_path else "mimocode.db"
+    return out
 
-    # 刷新按钮：不请求任何服务，只提示用户重跑命令（并可直接复制）
-    tip = ""
-    if cmd:
+
+def render_html(data: dict, *, cmd: str = "", out_path: str = "", live: dict | None = None) -> str:
+    public = _public_payload(data)
+    safe = (json.dumps(public, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(" ", "\\u2028").replace(" ", "\\u2029"))
+    kind = public.get("kind", "all")
+    title = _html.escape(KIND_TITLE.get(kind, "MiMo Desktop 用量"))
+    gen = datetime.fromtimestamp((public.get("generatedAt") or 0) / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+    cmd_esc = _html.escape(cmd)
+    db_label = _html.escape(public.get("dbLabel") or "mimocode.db")
+
+    live_js = "null"
+    btn_label = "重新生成"
+    if live:
+        live_js = json.dumps({
+            "reportUrl": live["reportUrl"],
+            "pageUrl": live.get("pageUrl", ""),
+        }, ensure_ascii=False)
+        btn_label = "刷新数据"
+        tip = '<div class="tip" id="refresh-banner" hidden></div>'
+    else:
         tip = (
-            '<div class="tip">数据为**生成时快照**。要刷新，重新运行：'
-            f'<code style="user-select:all;color:var(--text)">{cmd_esc}</code></div>'
+            '<div class="tip" id="refresh-banner">静态快照：页面内无法直连数据库。'
+            '需要页内刷新时请用 <code style="user-select:all;color:var(--text)">'
+            f'{cmd_esc or "python usage_cli.py --open"}</code> 打开实时看板。</div>'
         )
 
     return f"""<!doctype html>
@@ -1374,10 +1535,10 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "") -> str:
   <div class="head">
     <div>
       <h1>{title}</h1>
-      <div class="sub">生成时间 {gen} · 数据源 {_html.escape(data.get("dbPath", ""))}</div>
+      <div class="sub">更新时间 {gen} · 数据源 {db_label}</div>
     </div>
     <div class="acts">
-      <button class="btn" id="regen" type="button">重新生成</button>
+      <button class="btn" id="regen" type="button">{btn_label}</button>
     </div>
   </div>
   {tip}
@@ -1386,6 +1547,7 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "") -> str:
 <script>
 (function(){{
   var DATA = {safe};
+  var LIVE = {live_js};
   var CMD = {json.dumps(cmd)};
   var OUT = {json.dumps(out_path)};
   {_RUNTIME}
@@ -1423,13 +1585,14 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "") -> str:
   }});
 
   document.getElementById("regen").addEventListener("click", function(){{
-    var msg = "数据是静态快照，无法在页面内刷新。\\n\\n请重新运行这条命令：\\n" + CMD;
-    if (OUT) msg += "\\n\\n输出文件：\\n" + OUT;
-    if (navigator.clipboard && CMD) {{
-      navigator.clipboard.writeText(CMD).then(function(){{
-        alert(msg + "\\n\\n（命令已复制到剪贴板）");
-      }}, function(){{ alert(msg); }});
-    }} else {{ alert(msg); }}
+    if (LIVE) {{
+      refreshData();
+      return;
+    }}
+    var msg = "当前是静态快照，没有连接本地刷新服务。\\n\\n请重新打开实时看板：\\n" +
+      "python usage_cli.py --open";
+    if (OUT) msg += "\\n\\n快照文件：\\n" + OUT;
+    alert(msg);
   }});
 }})();
 </script>
@@ -1442,8 +1605,12 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 KNOWN_KINDS = ("all", "token", "session", "context")
-_SAFE_FLAGS = {"--open", "--print-path"}
-_SAFE_OPTS = {"--days", "--db", "--out", "--session", "--limit"}
+# "serve" / "service-check" 仅供本机进程间使用（安装器 preflight、测试、调试）；
+# 不进入用户 slash 命令白名单语义，但允许 CLI 直接调用。
+_INTERNAL_KINDS = ("serve", "service-check", "selfcheck")
+_SAFE_FLAGS = {"--open", "--print-path", "--shutdown", "--help", "-h"}
+_SAFE_OPTS = {"--days", "--db", "--out", "--session", "--limit",
+              "--token", "--idle-minutes", "--port", "--wait-seconds"}
 
 
 def _split_args(text: str) -> list[str]:
@@ -1491,13 +1658,19 @@ def _split_args(text: str) -> list[str]:
     return out
 
 
-def _sanitize_args(argv: list[str]) -> list[str]:
+def _sanitize_args(argv: list[str], dropped_out: list | None = None) -> list[str]:
     """Allow-list CLI args. Filesystem paths may contain Windows backslashes.
 
     This is not a shell-escaping function. Registered MiMo templates must not interpolate
     untrusted arguments into shell text; they now execute a fixed command only.
+
+    被丢弃的**选项**（以 ``-`` 开头）会在 stderr 明确提示。静默丢弃曾经造成过真实事故：
+    ``usage_cli.py --help`` 里的 ``--help`` 被丢掉，于是变成无参调用——既读了真实数据库、
+    又往用户数据目录写了一份报告，还会在没有数据库的机器上直接失败。这类"静默变形"必须
+    是可见的。
     """
     out: list[str] = []
+    dropped: list[str] = []
     i = 0
     shell_chars = ";|&$" + chr(96) + "><" + chr(10) + chr(13) + chr(92)
     while i < len(argv):
@@ -1521,15 +1694,23 @@ def _sanitize_args(argv: list[str]) -> list[str]:
             else:
                 out.extend((stripped, val))
             i += 1
-        elif stripped in KNOWN_KINDS:
+        elif stripped in KNOWN_KINDS or stripped in _INTERNAL_KINDS:
             out.append(stripped)
+        elif stripped.startswith("-"):
+            dropped.append(stripped)
         i += 1
+    if dropped:
+        print(f"提示：已忽略无法识别的选项 {' '.join(dropped)}"
+              f"（本命令只接受固定参数集；查看用法请用 --help）", file=sys.stderr)
+    if dropped_out is not None:
+        dropped_out.extend(dropped)
     return out
 
 
 def default_out_path(kind: str) -> str:
+    """默认写到用户可写数据目录，避免落在 Program Files / 安装目录 / 任意 CWD。"""
     stamp = datetime.now().strftime("%Y%m%d")
-    return os.path.abspath(f"mimo-usage-{kind}-{stamp}.html")
+    return os.path.abspath(os.path.join(default_data_dir(), f"mimo-usage-{kind}-{stamp}.html"))
 
 
 def build_command_hint(kind: str, days: int, out_path: str) -> str:
@@ -1543,28 +1724,730 @@ def build_command_hint(kind: str, days: int, out_path: str) -> str:
     return " ".join(f'"{p}"' if " " in p else p for p in parts)
 
 
+# ---------------------------------------------------------------------------
+# 本地只读刷新服务（loopback-only）
+# ---------------------------------------------------------------------------
+#
+# 为什么需要它：静态 file:// HTML 无法在页内重新读 SQLite；宿主插件接口没有
+# 「刷新已打开页面」的 API（见 docs/plugin-interface.md §7）。因此在用户显式
+# --open 时，拉起一个只监听 127.0.0.1 的极小只读 HTTP 服务：
+#   GET  /{token}/              → 自包含 HTML（嵌入 LIVE.reportUrl）
+#   GET  /{token}/api/report    → card_data JSON（无 dbPath）
+#   POST /{token}/api/shutdown  → 退出服务（需 token + loopback Host）
+# 安全：随机 path token、仅 loopback、Host/Origin 校验、GET-only 数据面、
+# 空闲自动退出、不暴露数据库绝对路径。
+
+
+def server_state_path() -> str:
+    return os.path.join(default_data_dir(), "live-server.json")
+
+
+def _host_is_loopback(host_header: str | None) -> bool:
+    if not host_header:
+        return False
+    host = host_header.strip().lower()
+    # strip port
+    if host.startswith("["):
+        # [::1]:port
+        host = host.split("]")[0] + "]"
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    return host in ("127.0.0.1", "localhost", "[::1]", "::1")
+
+
+def _origin_allowed(origin: str | None, port: int) -> bool:
+    """Origin 校验：缺失时放行（同源导航/部分 CLI），其余必须是本服务精确同源。
+
+    明确拒绝：
+    - ``null`` / ``file://``（沙箱 iframe、data:、本地文件页——Origin: null 不可信）
+    - 非 http(s)、非 loopback 主机
+    - 端口不一致（含省略端口，避免被 ``http://127.0.0.1`` 默认 80 口 CSRF）
+    - https（本服务只提供 http）
+    """
+    if not origin:
+        return True  # 同源导航 / 部分浏览器不带 Origin / CLI
+    o = origin.strip()
+    if not o or o.lower() in ("null", "file://"):
+        return False
+    try:
+        u = urlparse(o)
+    except ValueError:
+        return False
+    if u.scheme != "http":
+        return False
+    host = (u.hostname or "").lower()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    # 必须是显式端口且与本服务一致
+    return u.port == port
+
+
+class _UsageHandler(BaseHTTPRequestHandler):
+    server_version = "MimoUsage/1.0"
+    protocol_version = "HTTP/1.1"
+
+    # 挂在 server 上的上下文
+    # httpd.token / httpd.db / httpd.kind / httpd.days / httpd.session_id / httpd.limit
+    # httpd.lock / httpd.last / httpd.idle_seconds
+
+    def log_message(self, fmt: str, *args) -> None:  # 静音默认 stderr 访问日志
+        return
+
+    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def _json(self, code: int, obj: dict) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self._send(code, body, "application/json; charset=utf-8")
+
+    def _touch(self) -> None:
+        self.server.last = time.time()  # type: ignore[attr-defined]
+
+    def _drain_body(self) -> None:
+        """读掉请求体，避免 HTTP/1.1 keep-alive 下未读 body 造成连接错位。"""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            return
+        n = min(n, 1 << 20)  # 上限 1 MiB，防滥用
+        remaining = n
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
+
+    def _path_parts(self):
+        raw = self.path or "/"
+        if "?" in raw:
+            raw = raw.split("?", 1)[0]
+        parts = [p for p in raw.split("/") if p]
+        return parts
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._touch()
+        if not _host_is_loopback(self.headers.get("Host")):
+            self._json(403, {"error": "forbidden_host"})
+            return
+        origin = self.headers.get("Origin")
+        port = self.server.server_address[1]  # type: ignore[attr-defined]
+        if not _origin_allowed(origin, port):
+            self._json(403, {"error": "forbidden_origin"})
+            return
+        token = self.server.token  # type: ignore[attr-defined]
+        parts = self._path_parts()
+        if not parts or parts[0] != token:
+            self._json(404, {"error": "not_found"})
+            return
+        rest = parts[1:]
+        try:
+            if not rest or rest == ["index.html"]:
+                data = self._load()
+                live = {
+                    "reportUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/api/report",
+                    "pageUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/",
+                }
+                html = render_html(data, live=live)
+                self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if rest == ["api", "report"]:
+                data = self._load()
+                self._json(200, _public_payload(data))
+                return
+        except FileNotFoundError:
+            # 不回传 str(exc)：其中含数据库绝对路径，token 持有者也不应拿到
+            self._json(503, {"error": "db_missing"})
+            return
+        except sqlite3.Error:
+            self._json(503, {"error": "db_busy"})
+            return
+        except Exception:
+            self._json(500, {"error": "internal"})
+            return
+        self._json(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._touch()
+        self._drain_body()
+        if not _host_is_loopback(self.headers.get("Host")):
+            self._json(403, {"error": "forbidden_host"})
+            return
+        origin = self.headers.get("Origin")
+        port = self.server.server_address[1]  # type: ignore[attr-defined]
+        if not _origin_allowed(origin, port):
+            self._json(403, {"error": "forbidden_origin"})
+            return
+        token = self.server.token  # type: ignore[attr-defined]
+        parts = self._path_parts()
+        if not parts or parts[0] != token:
+            self._json(404, {"error": "not_found"})
+            return
+        if parts[1:] == ["api", "shutdown"]:
+            self._json(200, {"ok": True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()  # type: ignore[attr-defined]
+            return
+        self._json(404, {"error": "not_found"})
+
+    def _load(self) -> dict:
+        return card_data(
+            self.server.db,  # type: ignore[attr-defined]
+            kind=self.server.kind,  # type: ignore[attr-defined]
+            days=self.server.days,  # type: ignore[attr-defined]
+            session_id=self.server.session_id,  # type: ignore[attr-defined]
+            limit=self.server.limit,  # type: ignore[attr-defined]
+        )
+
+
+def create_usage_server(db: str, *, kind: str = "all", days: int = 30,
+                        session_id: str | None = None, limit: int | None = None,
+                        token: str | None = None, idle_minutes: int = DEFAULT_IDLE_MINUTES,
+                        port: int = 0) -> ThreadingHTTPServer:
+    """创建只监听 loopback 的 ThreadingHTTPServer（尚未 serve_forever）。"""
+    token = token or secrets.token_urlsafe(16)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+        raise ValueError("token 格式非法")
+    httpd = ThreadingHTTPServer((LOOPBACK_HOST, int(port or 0)), _UsageHandler)
+    httpd.daemon_threads = True
+    httpd.token = token  # type: ignore[attr-defined]
+    httpd.db = db  # type: ignore[attr-defined]
+    httpd.kind = kind if kind in KINDS else "all"  # type: ignore[attr-defined]
+    httpd.days = days  # type: ignore[attr-defined]
+    httpd.session_id = session_id  # type: ignore[attr-defined]
+    httpd.limit = limit  # type: ignore[attr-defined]
+    httpd.last = time.time()  # type: ignore[attr-defined]
+    httpd.idle_seconds = max(1, int(idle_minutes)) * 60  # type: ignore[attr-defined]
+    httpd.lock = threading.Lock()  # type: ignore[attr-defined]
+
+    real_shutdown = httpd.shutdown
+
+    def _idle_watchdog():
+        while True:
+            time.sleep(15)
+            try:
+                idle = time.time() - httpd.last  # type: ignore[attr-defined]
+                if idle >= httpd.idle_seconds:  # type: ignore[attr-defined]
+                    real_shutdown()
+                    return
+            except Exception:
+                return
+
+    threading.Thread(target=_idle_watchdog, daemon=True).start()
+    return httpd
+
+
+def live_urls(httpd: ThreadingHTTPServer) -> dict:
+    port = httpd.server_address[1]
+    token = httpd.token  # type: ignore[attr-defined]
+    page = f"http://{LOOPBACK_HOST}:{port}/{token}/"
+    return {
+        "pageUrl": page,
+        "reportUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/api/report",
+        "port": port,
+        "token": token,
+    }
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong(0)
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 服务身份校验（安装器 preflight 与复用逻辑共用）
+# ---------------------------------------------------------------------------
+#
+# 只凭「端口上有东西在听」就认定是本项目服务是不安全的：可能被其它程序占用，
+# 也可能是被篡改的状态文件。因此必须同时满足：
+#   1) 状态文件里的 token 合法、port 是 1..65535 的整数；
+#   2) GET /{token}/api/report 返回 200；
+#   3) 响应体是**本项目格式**（kind 属于已知视图 + generatedAt 为整数）。
+# 三条全过才认为是「自己的服务」，才允许发 shutdown / 复用。
+
+
+def _is_loopback_host(host: str) -> bool:
+    return (host or "").strip().lower() in ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def _url_is_loopback(url: str) -> bool:
+    """双保险：任何对外请求前都先确认目标是 loopback http。"""
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return False
+    return u.scheme == "http" and _is_loopback_host(u.hostname or "")
+
+
+def _fetch_json(url: str, timeout: float = 1.0):
+    """GET 一个 loopback URL 并解析 JSON。返回 (payload, error)；成功时 error 为 None。"""
+    import urllib.error
+    import urllib.request
+    if not _url_is_loopback(url):
+        return None, "refused_non_loopback"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None, f"http_{resp.status}"
+            body = resp.read(1 << 20)
+    except urllib.error.HTTPError as exc:
+        return None, f"http_{exc.code}"
+    except Exception as exc:
+        return None, f"unreachable_{exc.__class__.__name__}"
+    try:
+        return json.loads(body.decode("utf-8")), None
+    except (ValueError, UnicodeDecodeError):
+        return None, "payload_not_json"
+
+
+def _looks_like_our_payload(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("kind") not in KINDS:
+        return False
+    if isinstance(payload.get("generatedAt"), bool) or not isinstance(payload.get("generatedAt"), int):
+        return False
+    return any(isinstance(payload.get(k), dict) for k in ("token", "session", "context"))
+
+
+def _live_urls(port: int, token: str) -> dict:
+    """始终由 (port, token) 本地重建 URL，绝不采信状态文件里的 URL 文本。"""
+    base = f"http://{LOOPBACK_HOST}:{int(port)}/{token}"
+    return {"pageUrl": base + "/", "reportUrl": base + "/api/report",
+            "port": int(port), "token": token}
+
+
+def _valid_state_fields(st: dict):
+    """返回 (port, token) 或 None。只接受严格形态，不做类型强制转换。"""
+    token = st.get("token")
+    port = st.get("port")
+    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+        return None
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        return None
+    return port, token
+
+
+def _service_probe() -> dict:
+    """内部探针：与 ``service_status()`` 相同，但额外带上完整 token（不外泄）。"""
+    path = server_state_path()
+    status = {
+        "stateFile": path,
+        "statePresent": False,
+        "stateValid": False,
+        "reachable": False,
+        "owned": False,
+        "port": None,
+        "token": None,
+        "pid": None,
+        "reason": "no_state",
+    }
+    if not os.path.exists(path):
+        return status
+    status["statePresent"] = True
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        status["reason"] = "state_unreadable"
+        return status
+    if not isinstance(st, dict):
+        status["reason"] = "state_not_object"
+        return status
+    fields = _valid_state_fields(st)
+    if fields is None:
+        status["reason"] = "token_or_port_invalid"
+        return status
+    port, token = fields
+    status["stateValid"] = True
+    status["port"] = port
+    status["token"] = token
+    pid = st.get("pid")
+    status["pid"] = pid if (isinstance(pid, int) and not isinstance(pid, bool)) else None
+    payload, err = _fetch_json(_live_urls(port, token)["reportUrl"], timeout=1.2)
+    if err:
+        status["reason"] = err
+        return status
+    status["reachable"] = True
+    if _looks_like_our_payload(payload):
+        status["owned"] = True
+        status["reason"] = "ok"
+    else:
+        status["reason"] = "payload_not_ours"
+    return status
+
+
+def service_status() -> dict:
+    """公开报告：只暴露 token 前 6 位，避免完整凭据进入日志/对话记录。"""
+    status = _service_probe()
+    token = status.pop("token", None)
+    status["tokenPrefix"] = token[:6] if token else None
+    return status
+
+
+def cmd_service_check() -> int:
+    """`service-check` 内部子命令：向 stdout 输出 JSON 报告。"""
+    print(json.dumps(service_status(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_selfcheck() -> int:
+    """`selfcheck` 内部子命令：**不读数据库、不写任何文件**的环境自检。
+
+    安装器用它验证"这份 usage_cli.py 能被目标解释器启动且自身完整"。刻意不读库、
+    不建目录、不写文件：早起版本曾用 ``--help`` 承担这个职责，而 ``--help`` 会被参数
+    白名单丢弃 → 变成无参调用 → 读真实数据库 + 往用户数据目录写报告 + 在没有数据库的
+    机器上直接失败。任何副作用在这里都是不可接受的。
+    """
+    db = default_db_path()
+    info = {
+        "ok": True,
+        "python": "%d.%d.%d" % tuple(sys.version_info[:3]),
+        "supported": sys.version_info >= (3, 10),
+        "self": os.path.abspath(__file__),
+        "dataDir": default_data_dir(),
+        "dbPath": db,
+        "dbExists": os.path.exists(db),
+        "kinds": list(KINDS),
+        "internalKinds": list(_INTERNAL_KINDS),
+        "hasServer": callable(create_usage_server),
+    }
+    info["ok"] = bool(info["supported"] and info["hasServer"])
+    print(json.dumps(info, ensure_ascii=False, indent=2))
+    return 0 if info["ok"] else 3
+
+
+def read_server_state() -> dict | None:
+    try:
+        with open(server_state_path(), "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        if isinstance(obj, dict) and obj.get("port") and obj.get("token"):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def write_server_state(obj: dict) -> None:
+    path = server_state_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + f".tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(obj, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+    # 尽量收紧权限。注意：Windows 上 os.chmod 主要只支持只读位，0o600 不能当作
+    # ACL 已正确配置的证明；真正的边界是 %LOCALAPPDATA% 默认用户配置文件 ACL
+    # （同机其它用户默认不可读）。失败则忽略，不因此拒绝启动。
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def clear_server_state() -> None:
+    try:
+        os.unlink(server_state_path())
+    except OSError:
+        pass
+
+
+def _lock_path() -> str:
+    return os.path.join(default_data_dir(), "live-server.lock")
+
+
+def _lock_holder_pid(path: str) -> int | None:
+    try:
+        with open(path, "r", encoding="ascii", errors="ignore") as fh:
+            raw = (fh.read() or "").strip().splitlines()[:1]
+        if not raw:
+            return None
+        return int(raw[0])
+    except (OSError, ValueError):
+        return None
+
+
+def _acquire_start_lock(timeout: float = 12.0) -> bool:
+    """跨进程互斥：并发 --open 时只允许一个父进程 spawn serve 子进程。
+
+    创建方式是 O_CREAT|O_EXCL 原子创建；失败方等待。陈旧锁回收同时看
+    mtime 与锁文件内记录的持有者 PID 是否仍存活——持有者已死时不必等满 30s。
+    """
+    path = _lock_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(path)
+                stale = age > 30
+                if not stale and age > 0.4:
+                    holder = _lock_holder_pid(path)
+                    # 持有者进程已退出 → 立即视为陈旧（崩溃后的快速回收）
+                    if holder is not None and holder > 0 and not _pid_alive(holder):
+                        stale = True
+                    elif holder is None and age > 2.0:
+                        # 锁文件空/损坏且已存在一小会儿
+                        stale = True
+                if stale:
+                    os.unlink(path)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.05)
+    return False
+
+
+def _release_start_lock() -> None:
+    try:
+        os.unlink(_lock_path())
+    except OSError:
+        pass
+
+
+def _state_pid(st: dict) -> int:
+    pid = st.get("pid")
+    return pid if (isinstance(pid, int) and not isinstance(pid, bool)) else 0
+
+
+def _request_shutdown(port: int, token: str, timeout: float = 1.0) -> bool:
+    """用本项目协议请求关闭；url 由 (port, token) 本地重建，不采信状态文件文本。"""
+    import urllib.request
+    url = _live_urls(port, token)["pageUrl"] + "api/shutdown"
+    if not _url_is_loopback(url):
+        return False
+    try:
+        req = urllib.request.Request(url, method="POST", data=b"")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def try_reuse_server(db: str) -> dict | None:
+    """复用已有实例。只有身份三态全部通过才复用，绝不用状态文件里的 URL。"""
+    status = _service_probe()
+    if not (status["stateValid"] and status["reachable"] and status["owned"]):
+        if status["stateValid"] and status["reachable"] and not status["owned"]:
+            print("提示：live-server.json 指向的监听者不是本项目服务，已忽略该状态文件（未做任何强制动作）。",
+                  file=sys.stderr)
+        return None
+    st = read_server_state() or {}
+    recorded_db = st.get("db")
+    if recorded_db and os.path.abspath(str(recorded_db)) != os.path.abspath(db):
+        # 库路径不同：当前实例不服务本次请求。用本项目协议优雅关掉，避免它空转到 idle。
+        _request_shutdown(status["port"], status["token"])
+        return None
+    return {**_live_urls(status["port"], status["token"]),
+            "pid": status["pid"] or 0, "reused": True}
+
+
+def spawn_serve_child(db: str, *, kind: str = "all", days: int = 30,
+                      session_id: str | None = None, limit: int | None = None,
+                      token: str, idle_minutes: int = DEFAULT_IDLE_MINUTES) -> int:
+    """在 detached 子进程中启动 serve 循环；返回 pid。"""
+    script = os.path.abspath(__file__)
+    argv = [
+        sys.executable, script, "serve",
+        "--db", db,
+        "--token", token,
+        "--idle-minutes", str(int(idle_minutes)),
+    ]
+    if kind != "all":
+        argv += []  # serve 始终服务 all 视图数据；kind 由页面切换
+    if days and days != 30:
+        argv += ["--days", str(int(days))]
+    if session_id:
+        argv += ["--session", str(session_id)]
+    if limit:
+        argv += ["--limit", str(int(limit))]
+
+    kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        "cwd": default_data_dir() if os.path.isdir(default_data_dir()) else os.path.expanduser("~"),
+    }
+    if os.name == "nt":
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(argv, **kwargs)
+    return proc.pid
+
+
+def wait_for_server(token: str, timeout: float = 8.0) -> dict | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = read_server_state()
+        if st and st.get("token") == token:
+            fields = _valid_state_fields(st)
+            if fields is not None:
+                port, tok = fields
+                payload, err = _fetch_json(_live_urls(port, tok)["reportUrl"], timeout=1.2)
+                if err is None and _looks_like_our_payload(payload):
+                    return {**_live_urls(port, tok),
+                            "pid": _state_pid(st), "reused": False}
+        time.sleep(0.12)
+    return None
+
+
+def ensure_live_server(db: str, *, kind: str = "all", days: int = 30,
+                       session_id: str | None = None, limit: int | None = None,
+                       idle_minutes: int = DEFAULT_IDLE_MINUTES) -> dict | None:
+    reused = try_reuse_server(db)
+    if reused:
+        return reused
+    if not _acquire_start_lock():
+        # 拿不到锁：另一进程正在启动。锁超时后仍短暂轮询复用，避免刚好
+        # 对方刚写完 state、自己却直接返回 None。
+        for _ in range(8):
+            time.sleep(0.12)
+            reused = try_reuse_server(db)
+            if reused:
+                return reused
+        return None
+    try:
+        # 拿到锁后再查一次，避免排队期间实例已就绪
+        reused = try_reuse_server(db)
+        if reused:
+            return reused
+        token = secrets.token_urlsafe(16)
+        try:
+            pid = spawn_serve_child(
+                db, kind=kind, days=days, session_id=session_id, limit=limit,
+                token=token, idle_minutes=idle_minutes,
+            )
+        except Exception:
+            return None
+        live = wait_for_server(token)
+        if live:
+            live["pid"] = live.get("pid") or pid
+            return live
+        # 超时：尝试杀掉可能半启动的子进程
+        try:
+            if pid:
+                os.kill(pid, 9 if os.name == "nt" else 15)
+                time.sleep(0.1)
+                if _pid_alive(pid):
+                    os.kill(pid, 9)
+        except Exception:
+            pass
+        return None
+    finally:
+        _release_start_lock()
+
+
+def run_serve_loop(db: str, *, kind: str = "all", days: int = 30,
+                   session_id: str | None = None, limit: int | None = None,
+                   token: str | None = None,
+                   idle_minutes: int = DEFAULT_IDLE_MINUTES,
+                   port: int = 0) -> int:
+    """前台/子进程入口：阻塞 serve_forever，直到 idle 或 shutdown。"""
+    httpd = create_usage_server(
+        db, kind=kind, days=days, session_id=session_id, limit=limit,
+        token=token, idle_minutes=idle_minutes, port=port,
+    )
+    urls = live_urls(httpd)
+    write_server_state({
+        "pid": os.getpid(),
+        "port": urls["port"],
+        "token": urls["token"],
+        "pageUrl": urls["pageUrl"],
+        "reportUrl": urls["reportUrl"],
+        "db": os.path.abspath(db),
+        "kind": kind,
+        "days": days,
+        "startedAt": int(time.time() * 1000),
+        "idleMinutes": idle_minutes,
+    })
+    try:
+        httpd.serve_forever(poll_interval=0.2)
+    finally:
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+        # 只清理自己写下的 state
+        st = read_server_state()
+        if st and st.get("token") == urls["token"]:
+            clear_server_state()
+    return 0
+
+
+# subprocess 顶层导入（spawn 子进程服务用）
+
 def main(argv=None) -> int:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(
         prog="usage_cli.py",
-        description="MiMo Desktop 本机用量统计（离线生成静态 HTML，零 AI 参与）",
+        description="MiMo Desktop 本机用量统计（静态 HTML + 可选 loopback 实时刷新服务）",
     )
     parser.add_argument("kind", nargs="?", default="all",
-                        help="生成内容：all（默认）/ token / session / context")
+                        help="生成内容：all（默认）/ token / session / context / serve（内部）")
     parser.add_argument("--days", type=int, default=30, help="token 统计最近多少天（默认 30）")
     parser.add_argument("--db", default=None, help="数据库路径（默认 ~/.local/share/mimocode/mimocode.db）")
-    parser.add_argument("--out", default=None, help="输出 HTML 路径（默认当前目录 mimo-usage-<kind>-<日期>.html）")
+    parser.add_argument("--out", default=None,
+                        help="输出 HTML 路径（默认用户数据目录 mimo-usage-<kind>-<日期>.html）")
     parser.add_argument("--session", default=None, help="上下文视图指定的会话 ID（默认最近活跃）")
     parser.add_argument("--limit", type=int, default=None, help="上下文上限 tokens（覆盖内置模型表）")
-    parser.add_argument("--open", action="store_true", help="生成后用默认浏览器打开")
+    parser.add_argument("--open", action="store_true", help="启动/复用本地实时服务并用浏览器打开")
     parser.add_argument("--print-path", action="store_true", help="只在标准输出打印生成的文件路径")
+    parser.add_argument("--shutdown", action="store_true", help="请求关闭本机实时服务后退出")
+    parser.add_argument("--token", default=None, help="serve 模式 path token（内部/测试）")
+    parser.add_argument("--idle-minutes", type=int, default=DEFAULT_IDLE_MINUTES,
+                        help="serve 空闲退出分钟数（默认 240）")
+    parser.add_argument("--port", type=int, default=0, help="serve 监听端口（0=系统分配；仅 loopback）")
+    parser.add_argument("--wait-seconds", type=int, default=0,
+                        help="--shutdown 时等待服务真正退出的秒数（默认 0，只发请求不等）")
     parser.add_argument("--arg-string", default=None,
                         help="命令参数整串（由 shell 模板透传，内部按空白拆分后白名单校验）")
 
-    # ---- 命令注入防护：参数可能来自 shell 模板中的 $ARGUMENTS ----
-    # 模板写成 `... --arg-string $ARGUMENTS`（**故意不加引号**）：
-    #   * 不加引号 → 用户输入不会被 shell 截断（含引号时也不会提前闭合）；
-    #   * 代价是 shell 会按空白把它拆成多个 argv 元素，所以这里要把
-    #     `--arg-string` **之后的所有元素**重新拼成一整串，再按引号规则解析。
     if argv is None:
         argv = sys.argv[1:]
     argv = [str(a) for a in argv]
@@ -1572,18 +2455,93 @@ def main(argv=None) -> int:
         i = argv.index("--arg-string")
         joined = " ".join(argv[i + 1:])
         argv = argv[:i] + _split_args(joined)
+    dropped_flags: list = []
     try:
-        argv = _sanitize_args(argv)
+        argv = _sanitize_args(argv, dropped_flags)
     except ValueError as exc:
         print(f"MiMo 用量：参数错误（{exc}）", file=sys.stderr)
         return 2
+    # 收口：用户给了参数，但一个都没被识别 —— 绝不能"按默认行为跑一遍"。
+    # 这正是 `--help` 被丢弃后变成无参调用（读库 + 写报告）那条事故路径。
+    if dropped_flags and not argv:
+        print(f"MiMo 用量：参数错误（无法识别这些选项：{' '.join(dropped_flags)}）；"
+              f"未执行任何操作。查看用法请用 --help", file=sys.stderr)
+        return 2
 
+    # 内部子命令（serve / service-check）由显式词触发（固定 CLI，非 $ARGUMENTS）
+    raw_kind = argv[0] if argv and not argv[0].startswith("-") else "all"
+    is_internal = raw_kind in _INTERNAL_KINDS
     args = parser.parse_args(argv)
-    if args.kind not in KINDS:
+    if is_internal:
+        args.kind = raw_kind
+    elif args.kind not in KINDS:
         args.kind = "all"
 
     db = args.db or default_db_path()
-    out_path = os.path.abspath(args.out) if args.out else default_out_path(args.kind)
+    out_path = os.path.abspath(args.out) if args.out else default_out_path(
+        args.kind if args.kind in KINDS else "all")
+
+    # ---- 关闭实时服务 ----
+    # 三态身份校验通过才发 shutdown；不通过一律不猜、不强制结束。
+    if args.shutdown:
+        # 必须用内部探针：公开报告刻意不暴露完整 token
+        status = _service_probe()
+        if not status["statePresent"]:
+            print("无运行中的实时服务", file=sys.stderr)
+            return 1
+        if not status["stateValid"]:
+            print(f"状态文件无效（{status['reason']}）：未发送关闭请求，也未删除该文件", file=sys.stderr)
+            return 3
+        if not status["reachable"]:
+            print(f"状态文件存在但服务不可达（{status['reason']}）：未删除该文件。"
+                  f"若确有残留，可直接重新运行 --open 覆盖状态。", file=sys.stderr)
+            return 1
+        if not status["owned"]:
+            print("状态文件指向的监听者不是本项目服务：已拒绝发送关闭请求"
+                  "（不会按端口或 PID 强制结束任何进程）", file=sys.stderr)
+            return 3
+        if not _request_shutdown(status["port"], status["token"], timeout=2.0):
+            print("关闭实时服务失败", file=sys.stderr)
+            return 3
+        stopped = not service_status()["reachable"]
+        waited = 0.0
+        if args.wait_seconds > 0 and not stopped:
+            start = time.time()
+            while time.time() < start + args.wait_seconds:
+                if not service_status()["reachable"]:
+                    stopped = True
+                    break
+                time.sleep(0.2)
+            waited = time.time() - start
+        if not stopped:
+            print(f"已发送关闭请求，但服务在 {args.wait_seconds} 秒内仍未退出。"
+                  f"未做任何强制结束；请稍后重试或手动检查。", file=sys.stderr)
+            return 3
+        clear_server_state()
+        print("已关闭实时服务" + (f"（等待 {waited:.1f}s 退出）" if args.wait_seconds > 0 else ""))
+        return 0
+
+    # ---- service-check（内部，只读） ----
+    if args.kind == "service-check":
+        return cmd_service_check()
+
+    # ---- selfcheck（内部：不读库、不写文件） ----
+    if args.kind == "selfcheck":
+        return cmd_selfcheck()
+
+    # ---- serve 循环（内部） ----
+    if args.kind == "serve":
+        if not args.token:
+            print("serve 模式必须提供 --token", file=sys.stderr)
+            return 2
+        try:
+            return run_serve_loop(
+                db, days=args.days, session_id=args.session, limit=args.limit,
+                token=args.token, idle_minutes=args.idle_minutes, port=args.port,
+            )
+        except OSError as exc:
+            print(f"MiMo 用量：无法监听 loopback 端口（{exc}）", file=sys.stderr)
+            return 3
 
     try:
         data = card_data(db, kind=args.kind, days=args.days,
@@ -1595,24 +2553,38 @@ def main(argv=None) -> int:
         print(f"MiMo 用量：读取数据库失败（{exc}）", file=sys.stderr)
         return 3
 
-    cmd_hint = build_command_hint(args.kind, args.days, out_path)
-    html_doc = render_html(data, cmd=cmd_hint, out_path=out_path)
+    cmd_hint = build_command_hint(args.kind if args.kind in KINDS else "all", args.days, out_path)
+
+    live = None
+    opened_url = None
+    if args.open:
+        live = ensure_live_server(
+            db, kind=args.kind if args.kind in KINDS else "all",
+            days=args.days, session_id=args.session, limit=args.limit,
+        )
+
+    html_doc = render_html(data, cmd=cmd_hint, out_path=out_path, live=live)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(html_doc)
 
+    if args.open and live:
+        opened_url = live["pageUrl"]
+        try:
+            webbrowser.open(opened_url)
+        except Exception:
+            pass
+
     if args.print_path:
         print(out_path)
         return 0
 
-    # 供 `command` 模板内联使用：简洁的一行结果
-    print(f"MiMo 用量已生成：{out_path}")
-    if args.open:
-        try:
-            webbrowser.open("file:///" + out_path.replace("\\", "/"))
-        except Exception:
-            pass
+    # 供 `command` 模板内联使用：始终保持**一行**输出（MiMo 会原样复述）
+    if opened_url:
+        print(f"MiMo 用量已生成：{opened_url}（快照 {out_path}）")
+    else:
+        print(f"MiMo 用量已生成：{out_path}")
     return 0
 
 
