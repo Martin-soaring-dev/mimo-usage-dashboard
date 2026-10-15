@@ -76,6 +76,12 @@ PRODUCT = "mimo-usage-dashboard"
 OWNERSHIP_MARKER = "mimo-usage-dashboard:managed-file:v1"
 MANAGED_FILES = ("usage_cli.py", "register_command.py")
 
+# 判断既有 command.usage / command.usage-open 是否由本项目写入的唯一依据。
+# 刻意用脚本名子串而不是全路径比较：安装目录可以被 --install-dir 改到任意位置，
+# 但脚本名永远是这个。判错的代价方向是"把用户的命令误当成本项目的"，所以只有
+# 用户显式 --force 时才允许越过这条判断。
+OWNED_TEMPLATE_MARKER = "usage_cli.py"
+
 EXIT_OK = 0
 EXIT_NOCHANGE = 1
 EXIT_ARGS = 2
@@ -84,6 +90,16 @@ EXIT_NOTFOUND = 4
 EXIT_WRITE = 5
 EXIT_UNEDITABLE = 6
 EXIT_NEEDS_FORCE = 7
+
+
+class ForeignCommandError(Exception):
+    """既有同名命令不属于本项目。
+
+    与 JsoncStructureError 刻意不构成继承关系：前者是"结构改不了"（退出码 6），
+    本类是"改得了但不该自动改"（退出码 7，需人工确认）。两者混在一个 except 里
+    会让调用方把"请你确认"当成"结构坏了"，从而给出错误的修复建议。
+    """
+
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +652,8 @@ def verify_minimal_change(before: str, after: str, *,
                 raise JsoncStructureError("plugin 数组的非本项目元素被改动，拒绝落盘")
 
 def plan_edit(text: str, *, usage_tpl: str, open_tpl: str,
-              uninstall: bool = False, purge_plugin: bool = False):
+              uninstall: bool = False, purge_plugin: bool = False,
+              allow_foreign: bool = False):
     """生成就地修改计划，返回 ``(new_text, changed)``。
 
     所有拼接都只作用于 ``command.usage`` / ``command.usage-open`` 的文本片段
@@ -683,33 +700,54 @@ def plan_edit(text: str, *, usage_tpl: str, open_tpl: str,
         raise JsoncStructureError("command 不是对象，拒绝就地修改")
 
     cmd_obj = cmd_member.value
+
+    # 归属护栏：既有的 command.usage / command.usage-open 若不是本项目写进去的，
+    # 注册与注销都拒绝动手。这条判断以前只存在于 preflight —— 直接运行本脚本时
+    # 没有人消费它，于是用户的同名命令会被静默覆盖。--force 是唯一的显式越权开关，
+    # 由安装器在用户传 -Force 时透传。
+    if not allow_foreign:
+        foreign = foreign_commands(cmd_obj)
+        if foreign:
+            conflict = " / ".join(f"command.{n}" for n in foreign)
+            raise ForeignCommandError(
+                f"{conflict} 已存在，但模板不指向本项目脚本（{OWNED_TEMPLATE_MARKER}）"
+                f"→ 拒绝改动，以免覆盖你自己的命令。若确认这些条目确实由本项目的旧版本"
+                f"产生，请显式加 --force（会先备份原配置）。")
+
+    if uninstall:
+        # 注销：**一次收集、一次规划**。曾经按名字逐个调用 _plan_member_removals，
+        # 于是同一个分隔逗号被算进两个区间 → 区间重叠 → "内部错误：修改区间重叠"，
+        # 结果 `--uninstall` 在最常见的形态下直接失败。该函数本身按"连续区间"处理，
+        # 正是一次规划才能用对。
+        victims: list[int] = []
+        for name in ("usage", "usage-open"):
+            member = unique_member(cmd_obj, name)
+            if member is None:
+                continue
+            if member.value.kind != "object":
+                # 本项目写进去的永远是对象；非对象说明不是我们写的 → 不动它。
+                continue
+            victims.append(cmd_obj.members.index(member))
+        if victims:
+            splices.extend(_plan_member_removals(text, cmd_obj, victims))
+            changed = True
+        return _apply_splices(text, splices), changed
+
     pending: list = []
     for name, desc, tpl in (("usage", usage_desc, usage_tpl),
                             ("usage-open", open_desc, open_tpl)):
         member = unique_member(cmd_obj, name)
         if member is None:
-            if uninstall:
-                continue
             unit = _detect_indent_unit(text)
             indent = _insert_indent(text, cmd_obj)
-            literal = _object_literal(_entry_pairs(desc, tpl), _detect_newline(text), indent + unit, indent)
+            literal = _object_literal(_entry_pairs(desc, tpl),
+                                      _detect_newline(text), indent + unit, indent)
             pending.append((name, literal))
             changed = True
             continue
 
         if member.value.kind != "object":
-            if uninstall:
-                splices.extend(_plan_member_removals(
-                    text, cmd_obj, [cmd_obj.members.index(member)]))
-                changed = True
-                continue
             raise JsoncStructureError(f"command.{name} 不是对象，拒绝就地修改")
-
-        if uninstall:
-            splices.extend(_plan_member_removals(
-                text, cmd_obj, [cmd_obj.members.index(member)]))
-            changed = True
-            continue
 
         sub_splices, sub_changed = _plan_set_strings(text, member.value, [
             ("description", json.dumps(desc, ensure_ascii=False), desc),
@@ -877,6 +915,54 @@ def classify_managed_file(path: str, manifest) -> str:
     return "marker-only" if OWNERSHIP_MARKER in head else "unknown"
 
 
+def readable_template(member) -> tuple[bool, str]:
+    """读 ``command.<name>.template``，返回 ``(是否可读, 文本)``。
+
+    "不可读"指结构问题（不是对象、template 不是字符串、template 键重复）。
+    这类情况调用方要按**结构错误**（退出码 6）处理，而不是按归属不明：结构坏了比
+    归属不明更具体，给的修复建议也完全不同，不能混成一句"请加 --force"。
+    """
+    if member is None or member.value.kind != "object":
+        return False, ""
+    try:
+        sub = unique_member(member.value, "template")
+    except JsoncStructureError:
+        return False, ""
+    if sub is None or sub.value.kind != "string":
+        return False, ""
+    return True, sub.value.value or ""
+
+
+def looks_like_ours(member) -> bool:
+    """既有 command.usage / command.usage-open 是否由本项目写入。
+
+    preflight 与就地修改路径共用这一个判断，避免两处漂移后出现
+    "预检说不是我们的、写的时候却照样覆盖"这种最糟的组合。
+    """
+    readable, text = readable_template(member)
+    return readable and OWNED_TEMPLATE_MARKER in text
+
+
+def foreign_commands(cmd_obj) -> list[str]:
+    """既有的 command.usage / command.usage-open 里，哪些不属于本项目。
+
+    只有在"存在 + 是对象 + template 能读成字符串 + 不含归属标记"时才算外来的。
+    非对象成员不算：本项目写进去的永远是对象，注销路径对非对象本来就有"不动它"的
+    既有语义，注册路径则有自己的结构错误提示。
+    """
+    names: list[str] = []
+    for name in ("usage", "usage-open"):
+        member = unique_member(cmd_obj, name)
+        if member is None or member.value.kind != "object":
+            continue
+        readable, text = readable_template(member)
+        if not readable:
+            continue
+        if OWNED_TEMPLATE_MARKER not in text:
+            names.append(name)
+    return names
+
+
 def inspect_config(text: str) -> tuple[dict, int | None]:
     """检查配置能否安全就地修改。返回 ``(info, error_code)``。"""
     info = {
@@ -911,7 +997,6 @@ def inspect_config(text: str) -> tuple[dict, int | None]:
             return {**info, "shape": f"non-object-{name}",
                     "issues": [f"command.{name} 不是对象"]}, EXIT_UNEDITABLE
         info[flag] = True
-        template_value = None
         for sub in ("description", "template"):
             try:
                 sub_member = unique_member(member.value, sub)
@@ -923,9 +1008,7 @@ def inspect_config(text: str) -> tuple[dict, int | None]:
             if sub_member.value.kind in ("object", "array"):
                 return {**info, "shape": f"non-string-{name}-{sub}",
                         "issues": [f"command.{name}.{sub} 是 {sub_member.value.kind}"]}, EXIT_UNEDITABLE
-            if sub == "template" and sub_member.value.kind == "string":
-                template_value = sub_member.value.value or ""
-        if template_value and "usage_cli.py" in template_value:
+        if looks_like_ours(member):
             info["usageLooksOurs" if name == "usage" else "usageOpenLooksOurs"] = True
     return info, None
 
@@ -984,7 +1067,9 @@ def build_preflight_report(config_path: str, install_dir: str,
             _, would_change = plan_edit(text, usage_tpl=usage_tpl, open_tpl=open_tpl)
             report["upToDate"] = not would_change
             report["usageUpToDate"] = would_change is False
-        except JsoncStructureError:
+        except (JsoncStructureError, ForeignCommandError):
+            # 两种情况都只是"没法判定已是最新"：归属冲突已经由上面的
+            # forceReasons / requiresForce 表达，这里不要把它升级成异常。
             report["upToDate"] = False
 
     manifest_path = os.path.join(install_dir, "install-manifest.json")
@@ -1056,7 +1141,8 @@ def main(argv=None) -> int:
     parser.add_argument("--journal", default=None,
                         help="把本次执行记录（备份路径、写前/写后哈希）写入该 JSON 文件")
     parser.add_argument("--force", action="store_true",
-                        help="--preflight：允许存在需要人工确认的既有状态")
+                        help="允许改动归属不明的既有 command.usage / command.usage-open；"
+                             "--preflight 下则把「需人工确认」视为可继续")
     args = parser.parse_args(argv)
 
     if args.purge_legacy_plugin and args.uninstall:
@@ -1108,12 +1194,17 @@ def main(argv=None) -> int:
     try:
         candidate, changed = plan_edit(
             text, usage_tpl=usage_tpl, open_tpl=open_tpl,
-            uninstall=args.uninstall, purge_plugin=args.purge_legacy_plugin)
+            uninstall=args.uninstall, purge_plugin=args.purge_legacy_plugin,
+            allow_foreign=args.force)
         verify_minimal_change(
             text, candidate,
             ignore_top=({"plugin"} if args.purge_legacy_plugin else set()),
             ignore_in_command={"usage", "usage-open"},
             purge_plugin=args.purge_legacy_plugin)
+    except ForeignCommandError as exc:
+        # 归属冲突：退出码 7（需人工确认），与 --preflight 对同一情形返回的码一致。
+        print(f"FOREIGN_COMMAND: {exc}", file=sys.stderr)
+        return EXIT_NEEDS_FORCE
     except JsoncStructureError as exc:
         print(f"CANNOT_EDIT_IN_PLACE: {exc}", file=sys.stderr)
         return EXIT_UNEDITABLE

@@ -1,1 +1,0 @@
-{ "displayName": "用量查看（/usage）", "brief": "本地命令行：输入 /usage 生成静态 HTML 用量看板（token 用量、session 用量、上下文占用），零 AI、零服务。" }

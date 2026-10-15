@@ -13,7 +13,7 @@
 #
 # Usage: powershell -ExecutionPolicy Bypass -File install.ps1
 #          [-Python <exe>] [-Config <jsonc>] [-InstallDir <dir>]
-#          [-RemoveLegacy] [-Force] [-PreflightOnly]
+#          [-RemoveLegacy] [-Force] [-PreflightOnly] [-AllowDowngrade]
 
 [CmdletBinding()]
 param(
@@ -27,8 +27,11 @@ param(
   [switch]$RemoveLegacy,
   # 允许覆盖"归属不明"或"已被用户修改"的文件（安装前仍会备份）
   [switch]$Force,
-  # 只跑安装前检测并打印结论，不写任何文件
-  [switch]$PreflightOnly
+  # 只跑安装前检测并打印结论，不安装任何文件（会创建安装目录，并可能用本项目
+  # 协议关闭正在运行的本项目服务；身份校验不过则中止，绝不强杀）
+  [switch]$PreflightOnly,
+  # 已安装版本比本次要装的更新时，允许降级（默认拒绝；覆盖前仍会备份）
+  [switch]$AllowDowngrade
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,6 +115,7 @@ if ($InstallDir) { $engineArgs += @("--install-dir", $InstallDir) }
 if ($Force) { $engineArgs += "--force" }
 if ($RemoveLegacy) { $engineArgs += "--remove-legacy" }
 if ($PreflightOnly) { $engineArgs += "--preflight-only" }
+if ($AllowDowngrade) { $engineArgs += "--allow-downgrade" }
 
 # 引擎只往 stdout 写（诊断信息也走 stdout），所以这里不会被原生命令的 stderr 提升成
 # 终止性错误。判定只依赖退出码。

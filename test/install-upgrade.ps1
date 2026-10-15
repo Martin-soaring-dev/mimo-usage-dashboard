@@ -8,6 +8,8 @@
 #   T5 manifest 缺失时的安全行为 + 已是最新时不做无意义写入
 #   T6 真实 JSONC 注释 / CRLF / BOM / 制表符缩进保持（含"用户自建同名命令"必须 fail closed）
 #   T7 运行服务升级流程（身份校验 + 优雅关闭；伪造服务的负向用例）
+#   T8 无数据库的机器上也能安装，且安装不写用户数据
+#   T9 降级护栏（默认拒绝；-AllowDowngrade 才放行，且降级前先备份）
 #
 # 全部在临时目录中完成：不读取也不写入真实 mimocode.jsonc / 真实数据库 / 真实数据目录。
 # 运行：powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1
@@ -105,14 +107,15 @@ function Get-Backups {
 # 把安装目录伪造成"上一版的安装"：文件带本项目标记但内容不同，并同步 manifest 哈希
 # （这样它在 preflight 里会被判为 owned，从而走正常 upgrade 路径而不是 requiresForce）
 function Set-StaleInstall {
-  param([pscustomobject]$Case, [string]$Content = "#!/usr/bin/env python3`n# $marker`n# OLD RELEASE`n")
+  param([pscustomobject]$Case, [string]$Content = "#!/usr/bin/env python3`n# $marker`n# OLD RELEASE`n",
+        [string]$Version = "0.1.0")
   $cli = Join-Path $Case.Dest "usage_cli.py"
   $tmp = $cli + ".new"
   [System.IO.File]::WriteAllText($tmp, $Content)
   Move-Item -LiteralPath $tmp -Destination $cli -Force
   $m = Get-Manifest -Case $Case
   if ($null -ne $m) {
-    $m.version = "0.1.0"
+    $m.version = $Version
     $m.files.'usage_cli.py'.sha256 = (Get-Sha $cli)
     [System.IO.File]::WriteAllText((Join-Path $Case.Dest "install-manifest.json"), ($m | ConvertTo-Json -Depth 6))
   }
@@ -490,6 +493,36 @@ try {
   Check "T8: 安装目录里没有残留暂存目录" (
     @(Get-ChildItem -LiteralPath $t8.Dest -Force -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -like ".mimo-usage-stage-*" }).Count -eq 0)
+
+  # =========================================================================
+  Write-Host ""
+  Write-Host "=== T9 降级护栏（默认拒绝 / -AllowDowngrade 才放行）===" -ForegroundColor Cyan
+  # =========================================================================
+  $c9 = New-Case "t9-downgrade" "{`n  `"command`": {}`n}`n"
+  $r9a = Run-Install -Case $c9
+  Check "T9: 基线安装成功（exit 0）" ($r9a.Code -eq 0) "(code=$($r9a.Code))"
+  $pkgVer = (Read-Utf8 (Join-Path $root "package.json") | ConvertFrom-Json).version
+  # 伪造成"已装了更新的版本"：内容不同 + manifest 哈希同步 → 归属仍是 owned（不需 -Force）
+  Set-StaleInstall -Case $c9 -Version "99.0.0"
+  $stale9 = Get-Sha (Join-Path $c9.Dest "usage_cli.py")
+  $cfg9 = Get-Sha $c9.Config
+  $b9a = (Get-Backups -Case $c9).Count
+
+  $r9b = Run-Install -Case $c9
+  Check "T9: 未加开关 → 拒绝降级（非 0 退出）" ($r9b.Code -ne 0) "(code=$($r9b.Code))"
+  Check "T9: 拒绝时说明原因" ($r9b.Out -match "拒绝降级")
+  Check "T9: 拒绝时指出 -AllowDowngrade" ($r9b.Out -match "AllowDowngrade")
+  Check "T9: 拒绝时受管文件字节未变" ((Get-Sha (Join-Path $c9.Dest "usage_cli.py")) -eq $stale9)
+  Check "T9: 拒绝时配置字节未变" ((Get-Sha $c9.Config) -eq $cfg9)
+  Check "T9: 拒绝时未新增备份" ((Get-Backups -Case $c9).Count -eq $b9a)
+  Check "T9: 拒绝时 manifest 版本未变" ((Get-Manifest -Case $c9).version -eq "99.0.0")
+
+  $r9c = Run-Install -Case $c9 -Extra @("-AllowDowngrade")
+  Check "T9: -AllowDowngrade → 安装成功（exit 0）" ($r9c.Code -eq 0) "(code=$($r9c.Code))"
+  Check "T9: 降级后文件换成当前版本" (
+    (Get-Sha (Join-Path $c9.Dest "usage_cli.py")) -eq (Get-Sha (Join-Path $root "usage_cli.py")))
+  Check "T9: 降级后 manifest 记录当前版本" ((Get-Manifest -Case $c9).version -eq $pkgVer)
+  Check "T9: 降级前的旧文件已备份" ((Get-Backups -Case $c9).Count -gt $b9a)
 
 } catch {
   $script:ABORTED = "$($_.Exception.Message)"

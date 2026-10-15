@@ -7,16 +7,13 @@
   "license": "MIT",
   "author": "Martin-soaring-dev",
   "files": [
+    "bin",
     "usage_cli.py",
     "register_command.py",
     "installer.py",
     "install.ps1",
     "usage.cmd",
-    "skill",
     "docs",
-    "test/*.mjs",
-    "test/*.py",
-    "test/*.ps1",
     "README.md",
     "README.en.md",
     "LICENSE"
@@ -60,12 +57,19 @@
     "test:install": "powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1",
     "test:install-upgrade": "powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1",
     "test:live": "python test/e2e_live.py",
-    "test:all": "python test/test_python.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs && node test/ui-geometry.mjs && node test/refresh-e2e.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1 && python test/e2e_live.py"
+    "test:all": "python test/test_python.py && python test/test_installer.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs && node test/ui-geometry.mjs && node test/refresh-e2e.mjs && node test/cli.test.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1 && python test/e2e_live.py",
+    "test:installer": "python test/test_installer.py",
+    "test:npm": "node test/cli.test.mjs"
   },
   "engines": {
+    "node": ">=18",
     "python": ">=3.10"
   },
   "publishConfig": {
     "access": "public"
+  },
+  "bin": {
+    "mimo-usage-dashboard": "bin/mimo-usage.js",
+    "mimo-usage": "bin/mimo-usage.js"
   }
 }

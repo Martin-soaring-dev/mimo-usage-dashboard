@@ -1,4 +1,4 @@
-# MiMo Usage Dashboard
+﻿# MiMo Usage Dashboard
 
 > See where your MiMo Desktop tokens actually go.
 
@@ -53,7 +53,41 @@ the text — exactly the kind of deterministic local function that qwen code's `
 
 ## Install
 
-### Option A: one-liner script (Windows)
+### Option A: npm (recommended)
+
+```powershell
+npm install -g mimo-usage-dashboard
+mimo-usage-dashboard install
+```
+
+**Those are two different steps — running only the first one installs nothing.** `npm install -g` merely puts the CLI on your PATH (it touches none of your configuration); `mimo-usage-dashboard install` is what actually installs the dashboard into MiMo. Then **fully restart MiMo Desktop**, **open a new session** and type `/usage`.
+
+| Command | What it does |
+|---|---|
+| `mimo-usage-dashboard install` | Install (repeat installs take the same safe path; when already current no file is reinstalled, no backup is created and Backup/Stage/Apply/Verify are skipped — the only possible write is the manifest metadata when its recorded version lags the package) |
+| `mimo-usage-dashboard upgrade` | Upgrade to the version bundled with this CLI; **refuses to silently downgrade** (unless `--allow-downgrade`) |
+| `mimo-usage-dashboard uninstall` | Unregister and remove only files provably owned by this project and untouched by you; reports, database and backups are kept |
+| `mimo-usage-dashboard doctor` | Read-only health report: Python, config, registration, install state, running instance, residue. Exit 0 healthy / 1 warnings / 2 problems |
+| `mimo-usage-dashboard where` | Print every relevant path (useful when troubleshooting) |
+| `mimo-usage-dashboard version` | CLI version and installed version |
+| `mimo-usage-dashboard report` | Write a static snapshot and print its path (same as `/usage`) |
+| `mimo-usage-dashboard open` | Open the live board (same as `/usage-open`) |
+
+Common flags: `--config <mimocode.jsonc>`, `--install-dir <dir>`, `--python <python.exe>`. Beyond Python there are no other requirements, and the CLI itself has zero npm dependencies.
+
+To try it without a global install: `npx mimo-usage-dashboard doctor`.
+
+Uninstall:
+
+```powershell
+mimo-usage-dashboard uninstall                   # unregister + remove project files (keeps reports/DB/backups)
+mimo-usage-dashboard uninstall --keep-files      # unregister only, keep every file
+mimo-usage-dashboard uninstall --purge-backups   # also clear backups (listed before removal)
+```
+
+### Option B: one-liner script (Windows, no Node required)
+
+If you cloned the repository and have no Node on the machine:
 
 ```powershell
 git clone https://github.com/Martin-soaring-dev/mimo-usage-dashboard
@@ -79,8 +113,8 @@ Installs run as **Preflight → Backup → Stage → Validate → Apply → Veri
 - **A running instance of this server** is identity-checked (valid token + valid port + loopback + `/api/report` returning this project's payload) and then shut down through this project's own protocol, waiting for it to exit. It **never** taskkills, and never kills by port or by an unknown PID; if identity cannot be confirmed, the install aborts.
 - **Backup**: files this run would overwrite are copied to `<InstallDir>\.mimo-usage-backups\<timestamp>\`, and the config gets its own timestamped `.bak`. Backups, HTML reports, the database and unknown files are **never deleted automatically**.
 - **`-RemoveLegacy`** only cleans legacy files when explicitly requested, and a **non-empty directory** such as `skills\usage` additionally requires `-Force` before it is removed recursively (by default its contents are only listed).
-- **`-PreflightOnly`** runs detection and prints the plan without writing anything.
-- **Already current means no writes at all**: when both the files and the command registrations already match what would be installed, Backup/Stage/Apply/Verify are skipped and no new backup is created.
+- **`-PreflightOnly`** runs detection and prints the plan **without installing any file or touching your config**; it does create the target install directory and may gracefully shut down a running instance of this project's own service (own protocol only — identity is verified first, and it never force-kills by port or PID).
+- **Already current means no reinstall**: when both the program files and the command registrations already match what would be installed, nothing is reinstalled or overwritten, no new backup is created, and Backup/Stage/Apply/Verify are skipped. The only possible write is **metadata**: if the version recorded in `install-manifest.json` lags the current package version, the installer updates that one file; when the version already matches, the manifest is not rewritten and `installedAt` and its other fields stay as they were.
 
 Fail-closed by design: an explicit `-Python` that is missing or older than 3.10 aborts instead of falling back, every auto-detected interpreter must be ≥ 3.10, and a non-zero registration exit code aborts the install instead of printing success.
 
@@ -88,7 +122,7 @@ Config edit policy: `register_command.py` edits **in place** — it rewrites onl
 
 Then **fully restart MiMo Desktop** and **open a new session**.
 
-### Option B: manual
+### Option C: manual
 
 1. Put `usage_cli.py` and `register_command.py` anywhere (e.g. `D:\tools\mimo-usage\`).
 2. Run `python register_command.py`, or add a `command` block to
@@ -97,7 +131,7 @@ Then **fully restart MiMo Desktop** and **open a new session**.
 > The shell directive inside the template is a **real instruction** — the engine will execute it.
 > Never put it in comments or examples.
 
-### Option C: just run it, no command registered
+### Option D: just run it, no command registered
 
 ```bash
 python usage_cli.py --open          # Python ≥ 3.10, no third-party deps
@@ -111,7 +145,7 @@ On Windows you can also **double-click `usage.cmd`**.
 |---|---|
 | `/usage` | Overview (fixed safe command; suffix arguments are not parsed) |
 | `/usage-open` | Generate and open in the default browser |
-Output goes to the **current working directory**: `mimo-usage-<kind>-<date>.html`.
+Output goes to the **user data directory** (`%LOCALAPPDATA%\mimo-usage-dashboard` on Windows, `~/.local/share/mimo-usage-dashboard` elsewhere; override with `MIMO_USAGE_DATA_DIR` or `--out`): `mimo-usage-<kind>-<date>.html`.
 
 ### CLI
 
@@ -158,23 +192,25 @@ Source: the `message` / `part` / `session` tables in `~/.local/share/mimocode/mi
 ## Layout
 
 ```
+bin/mimo-usage.js           npm entry point (no third-party deps)
 usage_cli.py                core: read-only db → aggregate → self-contained HTML (stdlib only)
 register_command.py         writes /usage and /usage-open into mimocode.jsonc (JSONC-aware)
-install.ps1                 Windows installer
+installer.py                transactional install / upgrade / uninstall engine (single source of truth)
+install.ps1                 Windows shell: finds Python, forwards to installer.py
 usage.cmd                   double-click to generate + open
-skill/usage/                /usage command docs
-skill/mimo-usage-dashboard/ dashboard explanation (docs only, executes nothing)
 docs/architecture.md        engine mechanics evidence (command table, shell substitution)
 docs/plugin-interface.md    MiMo plugin interface survey
 test/test_python.py         Python e2e tests (aggregation / views / injection guard / JSONC)
+test/test_installer.py      installer engine tests (doctor / uninstall / residue, isolated)
 test/command-e2e.mjs        Node side: simulates the engine's template + shell pipeline
+test/cli.test.mjs           npm pack → install → full CLI lifecycle, isolated prefix
 ```
 
 ## Troubleshooting
 
 - **`/usage` does nothing**: confirm `mimocode.jsonc` has `command.usage`, then **fully restart** MiMo Desktop and **open a new session** (the command table is built at session start).
 - **`MiMo database not found`**: make sure MiMo Desktop has run at least once; or pass `--db` / set `MIMO_USAGE_DB`.
-- **Python not found**: install Python ≥ 3.10, or run `install.ps1 -Python <path>`.
+- **Python not found**: install Python ≥ 3.10, or point at an interpreter explicitly — `mimo-usage-dashboard install --python <path>` (or `MIMO_USAGE_PY`), or `install.ps1 -Python <path>` on the PowerShell path.
 
 ## Uninstall
 
@@ -182,7 +218,13 @@ test/command-e2e.mjs        Node side: simulates the engine's template + shell p
 python register_command.py --uninstall
 ```
 
-Then delete `~/.config/mimocode/usage-dashboard/`.
+Or let the CLI do it (recommended — it prints exactly what it kept):
+
+```powershell
+mimo-usage-dashboard uninstall
+```
+
+Manually: unregister the commands, then delete `~/.config/mimocode/usage-dashboard/` and the `command.usage` / `command.usage-open` entries.
 
 ## License
 

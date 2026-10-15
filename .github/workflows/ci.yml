@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -23,6 +23,13 @@ jobs:
       - run: npm install
       - name: Windows installer smoke test
         run: powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1
+      # 引擎层：uninstall / doctor / 残留体检（临时目录 + 合成数据）
+      - name: Installer engine tests (isolated)
+        run: python test/test_installer.py
+      # npm 真实安装流程：npm pack → 包内容与开发环境逐字节一致 → npm install 到临时
+      # prefix → 用 shim 跑 install/report/upgrade/doctor/uninstall
+      - name: npm package install flow
+        run: node test/cli.test.mjs
       # 安装器是可靠升级器：升级 / 失败回滚 / 混装检测 / 未知文件保留 /
       # manifest 缺失时的 fail-closed / JSONC 原地修改保持注释 / 运行服务升级。
       - name: Windows installer upgrade & rollback tests

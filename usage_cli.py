@@ -136,26 +136,68 @@ def model_context_limit(model_id: str | None) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-def _open_readonly(db_path: str) -> sqlite3.Connection:
-    """优先以只读 URI 打开；失败则复制一份快照（含 -wal/-shm）再读。"""
+def _open_readonly(db_path: str):
+    """优先以只读 URI 打开；失败则复制一份快照（含 -wal/-shm）再读。
+
+    返回 ``(conn, snapshot_dir)``：正常路径 ``snapshot_dir`` 为 None；快照回退
+    时是本次私有的临时目录（``mkdtemp`` 唯一命名）。调用方在 ``conn.close()``
+    之后必须删除该目录（见 ``_cleanup_snapshot``）——不删的话，被占用的数百 MB
+    数据库每次读取都会在 %TEMP% 留下一份完整拷贝。快照目录只属于本次调用，
+    删除不会影响并发的其它读者。
+    """
     uri = "file:" + db_path.replace("\\", "/").replace("?", "%3f").replace("#", "%23") + "?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=1.0)
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
-        return conn
+        return conn, None
     except sqlite3.Error:
         import shutil
         import tempfile
 
         tmp = tempfile.mkdtemp(prefix="mimo-usage-")
-        base = os.path.basename(db_path)
-        for suffix in ("", "-wal", "-shm"):
-            src = db_path + suffix
-            if os.path.exists(src):
-                shutil.copyfile(src, os.path.join(tmp, base + suffix))
-        conn = sqlite3.connect(os.path.join(tmp, base), timeout=1.0)
-        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
-        return conn
+        conn = None
+        try:
+            base = os.path.basename(db_path)
+            for suffix in ("", "-wal", "-shm"):
+                src = db_path + suffix
+                if os.path.exists(src):
+                    shutil.copyfile(src, os.path.join(tmp, base + suffix))
+            conn = sqlite3.connect(os.path.join(tmp, base), timeout=1.0)
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except BaseException:
+            # 初始化半途失败（复制不完整 / 快照打不开）：先关连接（Windows 上
+            # 打开着的文件删不掉），再清掉半成品并原样抛出，不在 %TEMP% 留垃圾。
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        return conn, tmp
+
+
+def _cleanup_snapshot(tmp: str) -> None:
+    """删除本次调用私有的只读快照目录（best-effort）。
+
+    只作用于 ``_open_readonly`` 自己 ``mkdtemp`` 出来的目录；先清只读位再删，
+    与 installer.force_rmtree 同一套 Windows 处理。删不掉就留着（与旧行为一致，
+    但正常路径下不会再遗留）。
+    """
+    import shutil
+    import stat
+
+    def _onerror(func, path, _exc_info):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+
+    try:
+        shutil.rmtree(tmp, onerror=_onerror)
+    except OSError:
+        pass
 
 
 def _loads(raw):
@@ -179,7 +221,7 @@ def read_usage(db_path: str) -> dict:
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"找不到 MiMo 数据库：{db_path}")
 
-    conn = _open_readonly(db_path)
+    conn, snap = _open_readonly(db_path)
     try:
         daily: dict[str, dict] = {}
         hourly: dict[str, dict] = {}
@@ -357,6 +399,8 @@ def read_usage(db_path: str) -> dict:
             conn.close()
         except sqlite3.Error:
             pass
+        if snap:
+            _cleanup_snapshot(snap)
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +463,7 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"找不到 MiMo 数据库：{db_path}")
 
-    conn = _open_readonly(db_path)
+    conn, snap = _open_readonly(db_path)
     try:
         sid = session_id
         if sid:
@@ -571,6 +615,8 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
             conn.close()
         except sqlite3.Error:
             pass
+        if snap:
+            _cleanup_snapshot(snap)
 
 
 # ---------------------------------------------------------------------------

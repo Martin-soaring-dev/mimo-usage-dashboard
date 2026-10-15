@@ -22,7 +22,8 @@ function ConvertFrom-Jsonc {
 try {
   New-Item -ItemType Directory -Force -Path $configDir | Out-Null
   $synthDb = Join-Path $temp "synth.db"
-  $fixture = "import sys, time; sys.path.insert(0, r'" + $PSScriptRoot + "\'); from test_python import make_db; make_db(sys.argv[1], int(time.time()*1000))"
+  # 注意：raw string 不能以反斜杠结尾，所以这里不能写成 r'...\test\'。
+  $fixture = "import sys, time; sys.path.insert(0, r'" + $PSScriptRoot + "'); from test_python import make_db; make_db(sys.argv[1], int(time.time()*1000))"
   & $python -c $fixture $synthDb | Out-Null
   # 测试全程隔离：连数据库也指向合成库，绝不读真实的 ~/.local/share/mimocode/mimocode.db
   $env:MIMO_USAGE_DB = $synthDb

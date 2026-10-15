@@ -1,4 +1,4 @@
-# MiMo Usage Dashboard
+﻿# MiMo Usage Dashboard
 
 > 看清明 MiMo Desktop 的 token 都花在哪了。
 
@@ -64,7 +64,43 @@
 
 ## 安装
 
-### 方式 A：一键脚本（Windows）
+### 方式 A：npm（推荐）
+
+```powershell
+npm install -g mimo-usage-dashboard
+mimo-usage-dashboard install
+```
+
+**这两条命令是两件事，别只跑第一条**：`npm install -g` 只是把这个 CLI 放到 PATH 上（不会碰你的任何配置）；`mimo-usage-dashboard install` 才真正把看板装进 MiMo。装完**彻底重启 MiMo Desktop**，再**新开一个会话**，然后输入 `/usage`。
+
+命令一览：
+
+| 命令 | 作用 |
+|---|---|
+| `mimo-usage-dashboard install` | 安装（重复安装/覆盖安装会走同一条安全路径；文件与命令都已是最新时不重装任何文件、不新建备份、不跑 Backup/Stage/Apply/Verify——唯一可能的写入是 manifest：其记录的版本落后时才更新这个元数据文件） |
+| `mimo-usage-dashboard upgrade` | 升级到当前 CLI 自带的版本；**拒绝静默降级**（除非 `--allow-downgrade`） |
+| `mimo-usage-dashboard uninstall` | 注销命令 + 删除"能证明属于本项目且未被你改过"的文件；报告/数据库/备份全保留 |
+| `mimo-usage-dashboard doctor` | 只读体检：Python、配置、注册、安装状态、运行实例、残留。退出码 0 健康 / 1 警告 / 2 有问题 |
+| `mimo-usage-dashboard where` | 打印全部关键路径（排错用） |
+| `mimo-usage-dashboard version` | CLI 版本 + 已安装版本 |
+| `mimo-usage-dashboard report` | 生成静态快照并打印路径（等价 `/usage`） |
+| `mimo-usage-dashboard open` | 打开实时看板（等价 `/usage-open`） |
+
+公共开关：`--config <mimocode.jsonc>`、`--install-dir <dir>`、`--python <python.exe>`。**不需要 Python 之外的任何额外依赖**；CLI 本身零 npm 依赖。
+
+要试一下而不装到全局：`npx mimo-usage-dashboard doctor`。
+
+卸载：
+
+```powershell
+mimo-usage-dashboard uninstall              # 注销 + 删除本项目文件（保留你的报告/数据库/备份）
+mimo-usage-dashboard uninstall --keep-files # 只注销，文件全留
+mimo-usage-dashboard uninstall --purge-backups   # 额外清理备份（会先列出再删）
+```
+
+### 方式 B：一键脚本（Windows，无需 Node）
+
+已经 clone 了仓库、机器上没有 Node 时用这条：
 
 ```powershell
 git clone https://github.com/Martin-soaring-dev/mimo-usage-dashboard
@@ -82,6 +118,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Config "C:\实际路径\mi
 
 ### 安装器是"可靠升级器"，不是一次性复制
 
+（`install.ps1` 只是 Windows 上的解释器探测 + 转发壳；事务逻辑在 `installer.py` 里，只有一份实现。）
+
 安装按 **Preflight → Backup → Stage → Validate → Apply → Verify** 六个阶段执行，任何阶段失败都会回滚本次改动：
 
 - **安装前检测**：目标目录是否已有本项目文件、是否存在 `install-manifest.json`、是否有本项目服务在运行。发现旧安装会进入 `upgrade`（有 manifest）或 `adopt`（无 manifest 但有本项目标记）模式，**不会直接覆盖**。
@@ -90,8 +128,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Config "C:\实际路径\mi
 - **运行中的本项目服务**：先做身份校验（token 合法 + 端口合法 + loopback + `/api/report` 返回本项目格式），通过后用本项目协议发 `shutdown` 并等待退出。**绝不 taskkill、绝不按端口或未知 PID 杀进程**；身份无法确认时直接中止。
 - **备份**：本次会被覆盖的文件复制到 `<InstallDir>\.mimo-usage-backups\<时间戳>\`，配置本身另有带时间戳的 .bak。**备份、HTML 报告、数据库、未知文件一律不会自动删除。**
 - **`-RemoveLegacy`**：只在显式指定时清理旧版遗留文件；`skills\usage` 这类**非空目录**还要再加 `-Force` 才会递归删除（默认只列出内容）。
-- **`-PreflightOnly`**：只做检测并打印结论，不写任何文件。
-- **已是最新时不做任何写入**：文件与命令注册都与本次内容一致时，直接跳过 Backup/Stage/Apply/Verify，也不会新增备份。
+- **`-PreflightOnly`**：只做检测并打印结论，**不安装任何文件、不改配置**；但会创建目标安装目录，并可能用本项目协议关闭正在运行的本项目服务（身份校验不过就直接中止，绝不按端口或 PID 强杀）。
+- **已是最新时不重装、不新建备份**：程序文件与命令注册都与本次内容一致时，不会重新安装或覆盖任何程序文件，不会新建安装备份，也不再执行 Backup/Stage/Apply/Verify。唯一可能的写入是**元数据**：若 `install-manifest.json` 记录的版本落后于当前包版本，安装器只更新这一个文件；版本已一致时连它也不重写，`installedAt` 等原有内容保持不变。
 
 失败即中止，不静默降级：显式指定的 `-Python` 不存在、或版本低于 3.10，都会直接报错而**不会**回退到其它解释器；自动探测到的解释器同样必须 ≥ 3.10；注册命令返回非零退出码时脚本立即中止，不会打印成功信息。
 
@@ -99,7 +137,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Config "C:\实际路径\mi
 
 安装后**彻底重启 MiMo Desktop**，再**新开一个会话**。
 
-### 方式 B：手动
+### 方式 C：手动
 
 1. 把 `usage_cli.py` 与 `register_command.py` 放到任意目录（例如 `D:\tools\mimo-usage\`）。
 2. 在 `~/.config/mimocode/mimocode.jsonc` 里加一个 `command` 段：
@@ -121,7 +159,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Config "C:\实际路径\mi
 >
 > 注意：模板里的 shell 指令是真正执行的命令，不要把它写进注释或示例。也可以直接运行 `python register_command.py` 自动注册。
 
-### 方式 C：只想直接看，不装命令
+### 方式 D：只想直接看，不装命令
 
 ```bash
 python usage_cli.py --open          # 需要 Python ≥ 3.10，无第三方依赖
@@ -137,7 +175,7 @@ Windows 也可以直接**双击 `usage.cmd`**。
 |---|---|
 | `/usage` | 生成总览页（固定安全命令，不解析后缀参数） |
 | `/usage-open` | 生成并用默认浏览器打开 |
-生成的文件默认落在**当前工作目录**：`mimo-usage-<kind>-<日期>.html`。
+生成的文件默认落在**用户数据目录**（Windows 为 `%LOCALAPPDATA%\mimo-usage-dashboard`，其它平台为 `~/.local/share/mimo-usage-dashboard`；可用 `MIMO_USAGE_DATA_DIR` 或 `--out` 覆盖）：`mimo-usage-<kind>-<日期>.html`。
 
 ### 直接跑 CLI
 
@@ -193,20 +231,24 @@ python usage_cli.py --print-path        # 只打印路径（便于脚本串联�
 ## 仓库结构
 
 ```
+bin/mimo-usage.js           npm 入口（零第三方依赖）
 usage_cli.py                核心：只读 db → 聚合 → 渲染自包含 HTML（纯标准库）
 register_command.py         把 /usage 与 /usage-open 写进 mimocode.jsonc（JSONC 感知）
-install.ps1                 Windows 一键安装
+installer.py                安装/升级/卸载的事务引擎（唯一事实来源）
+install.ps1                 Windows 薄壳：探测 Python 并转发给 installer.py
 usage.cmd                   双击即用（生成 + 打开）
-skill/usage/                /usage 命令说明
-skill/mimo-usage-dashboard/ 用量看板说明（纯文档，不执行任何操作）
 docs/architecture.md        架构与引擎机制实证（命令注册、shell 替换、为何弃用服务）
 docs/plugin-interface.md    MiMo 插件接口调研（Hooks / ToolContext / 加载机制）
 test/test_python.py         Python 端到端测试（聚合口径 / 视图 / 注入防护 / JSONC / 只读保证）
+test/test_installer.py      安装器引擎隔离测试（doctor / uninstall / 残留体检）
 test/runtime-check.mjs      在 VM 沙箱里真实执行内联 JS，渲染四种视图
 test/command-e2e.mjs        Node 侧：模拟引擎的模板替换与 shell 提取
 test/ui-dom.mjs             内联 JS 的 UI 行为回归（热力图提示 / 时间尺度 / 模型条 / 分类树）
 test/ui-geometry.mjs        真实浏览器（无头 Chrome + CDP）的几何回归，见下
 test/cdp.mjs                无头 Chrome + CDP 的最小封装（被上面两个文件共用）
+test/cli.test.mjs           npm pack → 安装 → 全生命周期（临时 prefix，不碰全局环境）
+test/install-smoke.ps1      Windows 安装冒烟测试（隔离配置）
+test/install-upgrade.ps1    升级 / 回滚 / 残留 / 降级护栏测试（隔离配置）
 ```
 
 ## 开发
@@ -226,7 +268,7 @@ python usage_cli.py --open  # 手动查看
 
 - **输入 `/usage` 没反应**：确认 `mimocode.jsonc` 里有 `command.usage`，然后**彻底重启** MiMo Desktop，再**新开一个会话**（引擎在会话开始时构建命令表）。
 - **报错 `找不到 MiMo 数据库`**：确认 MiMo Desktop 至少成功用过一次；或用 `--db` 指定路径 / 设 `MIMO_USAGE_DB`。
-- **报错找不到 Python**：装 Python ≥ 3.10，或 `install.ps1 -Python <python.exe 路径>`。
+- **报错找不到 Python**：装 Python ≥ 3.10，或显式指定解释器——`mimo-usage-dashboard install --python <路径>`（也可用环境变量 `MIMO_USAGE_PY`），走 PowerShell 路径时用 `install.ps1 -Python <路径>`。
 - **页面打不开**：确认文件已生成（CLI 会打印绝对路径）；或改用 `--open`。
 - **上下文显示「上限未知」**：该模型不在内置上限表里，只展示占用绝对值；可用 `--limit` 显式指定。
 
@@ -236,7 +278,13 @@ python usage_cli.py --open  # 手动查看
 python register_command.py --uninstall          # 从 mimocode.jsonc 移除命令
 ```
 
-再删除 `~/.config/mimocode/usage-dashboard/` 即可。
+或直接用 CLI 卸载（推荐，会逐条打印保留了哪些东西）：
+
+```powershell
+mimo-usage-dashboard uninstall
+```
+
+只想手工清理也可以：注销命令后删除 `~/.config/mimocode/usage-dashboard/` 与配置里的 `command.usage` / `command.usage-open`。
 
 ## License
 

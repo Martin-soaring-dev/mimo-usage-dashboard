@@ -509,6 +509,96 @@ def main() -> int:
           not any(k in inspect.getsource(U) for k in
                   ("INSERT INTO", "UPDATE ", "DELETE FROM", "CREATE TABLE", "ATTACH", "PRAGMA")))
 
+    # ---- 3e. 只读快照回退的临时副本生命周期（Release Gate 回归） ----
+    # 旧实现：_open_readonly 失败回退时 mkdtemp 整库拷贝到 %TEMP%，**从不删除**
+    # —— 被占用的库每次读取都永久漏一份（本机库可达数百 MB）。现在必须：
+    #   * 正常直读不产生任何快照目录；
+    #   * 走快照回退时，调用方关闭连接后目录被删除；
+    #   * 初始化半途失败不留半成品；
+    #   * 只删本次调用私有的 mkdtemp 目录。
+    print("\n=== 只读快照回退（临时副本生命周期） ===")
+    import shutil as _shutil
+
+    snap_root = os.path.join(tmpdir, "snap-tmp")
+    os.makedirs(snap_root, exist_ok=True)
+    old_tempdir = tempfile.tempdir
+    tempfile.tempdir = snap_root
+    real_connect = sqlite3.connect
+    try:
+        def _snap_leftovers():
+            return [n for n in os.listdir(snap_root) if n.startswith("mimo-usage-")]
+
+        # 正常路径：直读成功，不得产生快照目录
+        U.read_usage(dbw)
+        check("正常只读路径不产生快照目录", _snap_leftovers() == [], f"({_snap_leftovers()})")
+
+        # 强制走快照回退：第一次 connect（只读 URI）模拟"database is locked"，
+        # 之后的真实 connect 打开快照副本。比拿 EXCLUSIVE 锁可靠（Windows 上
+        # 强制字节锁会让快照复制本身也失败）。
+        snap_db = os.path.join(tmpdir, "snap.db")
+        make_db(snap_db, int(time_module.time() * 1000))
+        fail_once = {"armed": True}
+
+        def _connect_first_fails(*a, **kw):
+            if fail_once["armed"]:
+                fail_once["armed"] = False
+                raise sqlite3.OperationalError("simulated: database is locked")
+            return real_connect(*a, **kw)
+
+        sqlite3.connect = _connect_first_fails
+        try:
+            conn_s, snap_s = U._open_readonly(snap_db)
+        finally:
+            sqlite3.connect = real_connect
+        check("锁冲突时走快照回退并返回快照目录", snap_s is not None)
+        if snap_s is not None:
+            n_master = conn_s.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
+            check("快照连接可查询", isinstance(n_master, int))
+            check("快照目录落在受控临时根下",
+                  os.path.isdir(snap_s) and os.path.abspath(snap_s).startswith(os.path.abspath(snap_root)),
+                  f"({snap_s})")
+            check("快照内含数据库副本",
+                  os.path.isfile(os.path.join(snap_s, os.path.basename(snap_db))))
+            try:
+                conn_s.close()
+            except sqlite3.Error:
+                pass
+            U._cleanup_snapshot(snap_s)
+            check("关闭连接并清理后快照目录已删除", not os.path.exists(snap_s))
+        check("清理后不留任何 mimo-usage-* 目录", _snap_leftovers() == [], f"({_snap_leftovers()})")
+
+        # 调用方路径：read_usage 走快照回退后，finally 必须删掉快照目录
+        fail_once["armed"] = True
+        sqlite3.connect = _connect_first_fails
+        try:
+            usage_via_snap = U.read_usage(dbw)
+        finally:
+            sqlite3.connect = real_connect
+        check("read_usage 经快照回退仍返回完整数据",
+              isinstance(usage_via_snap, dict) and usage_via_snap.get("totals", {}).get("total", 0) >= 0)
+        check("read_usage 结束后快照目录已清理", _snap_leftovers() == [], f"({_snap_leftovers()})")
+
+        # 初始化半途失败：主库是垃圾字节 → 快照副本打不开 → 清掉半成品再抛
+        garbage_db = os.path.join(tmpdir, "garbage.db")
+        with open(garbage_db, "wb") as fh:
+            fh.write(b"this is not a sqlite database at all")
+        fail_once["armed"] = True
+        raised = None
+        sqlite3.connect = _connect_first_fails
+        try:
+            U._open_readonly(garbage_db)
+        except sqlite3.Error as exc:
+            raised = exc
+        except OSError:
+            raised = None  # 复制阶段失败同样必须已清理
+        finally:
+            sqlite3.connect = real_connect
+        check("垃圾数据库经快照回退后如实抛错（不静默吞掉）", raised is not None)
+        check("初始化失败后不遗留半成品快照目录", _snap_leftovers() == [], f"({_snap_leftovers()})")
+    finally:
+        tempfile.tempdir = old_tempdir
+        sqlite3.connect = real_connect
+
     # ---- 4. 注入防护 ----
     print("\n=== 参数白名单（注入防护） ===")
     check("拒绝分号拼接", U._sanitize_args(["token", ";", "rm", "-rf", "/"]) == ["token"])
@@ -606,12 +696,14 @@ def main() -> int:
         with open(path, "rb") as fh:
             return fh.read()
 
+    # 既有 usage 条目必须是"本项目以前写进去的"（template 里含脚本名 usage_cli.py），
+    # 否则会被归属护栏按"用户的同名命令"拒绝改动 —— 那正是下面 ownership 一节在测的事。
     base_cfg = (
         "{\n"
         "  // 用户自己的注释\n"
         '  "command": {\n'
         '    "existing-command": {"description": "keep me", "template": "unchanged"},\n'
-        '    "usage": {"description": "old", "template": "old", "agent": "custom-agent"}\n'
+        '    "usage": {"description": "old", "template": "old usage_cli.py old", "agent": "custom-agent"}\n'
         "  },\n"
         '  "plugin": ["usage-dashboard.mjs", "example-user-plugin.mjs"],\n'
         '  "mcp": {}\n'
@@ -717,6 +809,34 @@ def main() -> int:
     check("--uninstall 默认保留 plugin",
           j9["plugin"] == ["usage-dashboard.mjs", "example-user-plugin.mjs"])
 
+    # 回归（2026-10-14 新增 uninstall 流程时暴露）：注销曾经按名字逐个规划移除，
+    # 于是同一个分隔逗号被算进两个相邻区间 → "内部错误：修改区间重叠"。
+    # 下面三种形态分别覆盖：只有一个目标成员、两个连续成员、两个不连续成员。
+    d11, p11 = new_cfg("uninstall-single",
+                       '{"command": {"usage": {"description": "a", "template": "a usage_cli.py"}}}\n')
+    code11, out11, err11 = run_reg(p11, extra=["--uninstall"])
+    check("注销单个 usage 能成功", code11 == 0, f"(code={code11}, err={err11.strip()[:80]})")
+    check("注销后 command 为空", load(p11)["command"] == {})
+
+    d12, p12 = new_cfg("uninstall-both-empty", '{"command": {}}\n')
+    check("空 command 注册两个命令", run_reg(p12)[0] == 0 and set(load(p12)["command"]) == {"usage", "usage-open"})
+    code12, out12, err12 = run_reg(p12, extra=["--uninstall"])
+    check("注销两个连续成员能成功（回归：区间重叠）", code12 == 0,
+          f"(code={code12}, err={err12.strip()[:120]})")
+    check("注销后 command 为空且文件可解析", load(p12)["command"] == {})
+
+    d13, p13 = new_cfg(
+        "uninstall-split",
+        '{"command": {"usage": {"description": "a", "template": "a usage_cli.py"}, '
+        '"middle": {"description": "m", "template": "m"}, '
+        '"usage-open": {"description": "c", "template": "c usage_cli.py"}}}\n')
+    code13, out13, err13 = run_reg(p13, extra=["--uninstall"])
+    j13 = load(p13)
+    check("注销两个不连续成员能成功（回归：区间重叠）", code13 == 0,
+          f"(code={code13}, err={err13.strip()[:120]})")
+    check("中间的用户命令条目原样保留", list(j13["command"]) == ["middle"]
+          and j13["command"]["middle"]["template"] == "m")
+
     # BOM：原文件带 BOM 时写入后仍带 BOM
     d10, p10 = new_cfg("bom", base_cfg, bom=True)
     code10, _, _ = run_reg(p10)
@@ -736,13 +856,17 @@ def main() -> int:
         """把指定顶层成员整段折叠掉，用于逐字节比较"其余部分是否原样"。"""
         return R._without_members(text, set(keys))
 
-    def apply_and_compare(name, before_text, bom=False, newline="\n", keys=("command",)):
-        d, p = new_cfg(name, before_text, bom=bom)
+    def write_fixture(name, text, bom=False, newline="\n"):
+        d, p = new_cfg(name, text, bom=bom)
         if newline != "\n":
             with open(p, "wb") as fh:
-                fh.write((("\ufeff" if bom else "") + before_text).replace("\n", newline).encode("utf-8"))
+                fh.write((("\ufeff" if bom else "") + text).replace("\n", newline).encode("utf-8"))
+        return d, p
+
+    def apply_and_compare(name, before_text, bom=False, newline="\n", keys=("command",), extra=()):
+        d, p = write_fixture(name, before_text, bom=bom, newline=newline)
         raw_before = read(p)
-        code, out, err = run_reg(p)
+        code, out, err = run_reg(p, extra=extra)
         raw_after = read(p)
         text_before = raw_before.decode("utf-8-sig")
         text_after = raw_after.decode("utf-8-sig")
@@ -754,6 +878,9 @@ def main() -> int:
         return code, raw_before, raw_after, text_after
 
     # T6：注释 / CRLF / BOM / 制表符缩进 / 嵌套 / 既有同名条目字段
+    # 注意这里的 usage 是**用户自己写的**（template "mine" 里没有本项目脚本名），
+    # 所以默认必须 fail closed、一字不动；只有显式 --force 才允许覆盖 ——
+    # 覆盖时下面的字节保留断言全部照旧成立。
     t6 = (
         "{\r\n"
         "\t// 制表符缩进 + CRLF + 注释\r\n"
@@ -766,8 +893,18 @@ def main() -> int:
         '\t"mcp": { "servers": { "a": { "url": "http://x" } } }\r\n'
         "}\r\n"
     )
-    code6, rb6, ra6, ta6 = apply_and_compare("t6-jsonc", t6, bom=True, newline="\r\n")
-    check("T6: 退出码 0", code6 == 0, f"(code={code6})")
+    d6r, p6r = write_fixture("t6-refuse", t6, bom=True, newline="\r\n")
+    raw6r = read(p6r)
+    code6r, _o6r, err6r = run_reg(p6r)
+    check("T6: 用户自建同名命令 → 默认 fail closed（退出码 7）", code6r == 7, f"(code={code6r})")
+    check("T6: 拒绝时说明冲突原因与越权开关",
+          "FOREIGN_COMMAND" in err6r and "不指向本项目" in err6r and "--force" in err6r)
+    check("T6: 拒绝时文件逐字节未变", read(p6r) == raw6r)
+    check("T6: 拒绝时不产生备份", backups(d6r) == [])
+
+    code6, rb6, ra6, ta6 = apply_and_compare("t6-jsonc", t6, bom=True, newline="\r\n",
+                                             extra=("--force",))
+    check("T6: 显式 --force 后退出码 0", code6 == 0, f"(code={code6})")
     check("T6: BOM 保留", ra6[:3] == b"\xef\xbb\xbf")
     check("T6: CRLF 保留", b"\r\n" in ra6 and b"\n" not in ra6.replace(b"\r\n", b""))
     check("T6: 制表符缩进保留", b"\t\t\"other\"" in ra6 or b"\t\t\"usage\"" in ra6)
@@ -798,6 +935,85 @@ def main() -> int:
     check("重复注册返回 1", code_i == 1 and out_i.strip() == "already-registered", f"(code={code_i})")
     check("重复注册不新增备份", len(backups(d_i)) == n_bak_1)
     check("重复注册不改变字节", read(p_i) == raw_i)
+
+    # ---- Release Hardening：命令归属护栏（usage command ownership regression） ----
+    # 回归目标：**直接运行本脚本**时，绝不能覆盖或删除"不是本项目写的"
+    # command.usage / command.usage-open。这条判断以前只存在于 preflight，只有走
+    # 安装器时才生效，直接调用本脚本会把用户的同名命令静默改掉。
+    print("\n=== 命令归属护栏（usage command ownership regression）===")
+
+    foreign_cfg = (
+        "{\n"
+        "  // 用户自己的注释\n"
+        '  "command": {\n'
+        '    "usage": {"description": "我的", "template": "run-my-own-thing", "agent": "my-agent"},\n'
+        '    "mine-open": {"description": "keep", "template": "keep"}\n'
+        "  },\n"
+        '  "myField": 7\n'
+        "}\n"
+    )
+
+    # 1) 用户已有 usage 命令 → 注册必须失败
+    d_o1, p_o1 = new_cfg("own-foreign", foreign_cfg)
+    before_o1 = read(p_o1)
+    code_o1, _out_o1, err_o1 = run_reg(p_o1)
+    check("归属: 用户自己的 usage → 注册 fail closed（退出码 7）", code_o1 == 7, f"(code={code_o1})")
+    check("归属: 不覆盖用户命令（文件逐字节未变）", read(p_o1) == before_o1)
+    check("归属: 不删除用户命令", "usage" in load(p_o1)["command"])
+    check("归属: 错误信息点名冲突成员与原因",
+          "command.usage" in err_o1 and "不指向本项目脚本" in err_o1,
+          f"({err_o1.strip()[:90]})")
+    check("归属: 拒绝时不产生备份", backups(d_o1) == [])
+
+    # 2) 已有本项目 usage（template 指向 usage_cli.py）→ 允许更新
+    d_o2, p_o2 = new_cfg(
+        "own-ours",
+        "{\n"
+        '  "command": {\n'
+        '    "usage": {"description": "旧", "template": "x usage_cli.py y", "agent": "keep-me"}\n'
+        "  }\n"
+        "}\n")
+    code_o2, _out_o2, _err_o2 = run_reg(p_o2)
+    check("归属: 本项目的 usage → 允许更新（退出码 0）", code_o2 == 0, f"(code={code_o2})")
+    j_o2 = load(p_o2)
+    check("归属: 更新后模板指向本项目",
+          j_o2["command"]["usage"]["template"].startswith("用户请求查看"),
+          f"({j_o2['command']['usage']['template'][:24]})")
+    check("归属: 无关字段 agent 保留", j_o2["command"]["usage"].get("agent") == "keep-me")
+
+    # 3) 用户自定义字段保留（--force 之后也不许丢）
+    d_o3, p_o3 = new_cfg("own-force", foreign_cfg)
+    code_o3, _out_o3, _err_o3 = run_reg(p_o3, extra=["--force"])
+    j_o3 = load(p_o3)
+    check("归属: --force 才允许覆盖（退出码 0）", code_o3 == 0, f"(code={code_o3})")
+    check("归属: --force 后用户新增字段仍保留",
+          j_o3["command"]["usage"].get("agent") == "my-agent")
+    check("归属: --force 后邻居命令与顶层字段保留",
+          j_o3["command"]["mine-open"]["template"] == "keep" and j_o3["myField"] == 7)
+    check("归属: --force 后注释仍逐字节保留",
+          "// 用户自己的注释" in read(p_o3).decode("utf-8-sig"))
+    check("归属: --force 时先写了备份", len(backups(d_o3)) == 1)
+
+    # 4) 注销同样不许删用户的同名命令
+    d_o4, p_o4 = new_cfg("own-uninstall", foreign_cfg)
+    before_o4 = read(p_o4)
+    code_o4, _out_o4, err_o4 = run_reg(p_o4, extra=["--uninstall"])
+    check("归属: 注销用户自己的 usage → fail closed（退出码 7）", code_o4 == 7, f"(code={code_o4})")
+    check("归属: 注销被拒后文件逐字节未变", read(p_o4) == before_o4)
+    check("归属: 注销被拒时给出归属原因", "FOREIGN_COMMAND" in err_o4)
+    code_o4b, _out_o4b, _err_o4b = run_reg(p_o4, extra=["--uninstall", "--force"])
+    check("归属: --uninstall --force 才移除", code_o4b == 0, f"(code={code_o4b})")
+    check("归属: 注销不误删邻居命令",
+          "usage" not in load(p_o4)["command"]
+          and load(p_o4)["command"]["mine-open"]["template"] == "keep")
+
+    # 5) 结构问题优先报 6：不能把"结构坏了"说成"归属不明"
+    for nm, txt in (("usage.template 不是字符串", '{"command": {"usage": {"template": {}}}}\n'),
+                    ("usage 无 template", '{"command": {"usage": {"description": []}}}\n')):
+        _d_s, p_s = new_cfg("own-struct", txt)
+        code_s, _out_s, err_s = run_reg(p_s)
+        check(f"归属: {nm} → 仍按结构错误报 6（不报归属冲突）",
+              code_s == 6 and "FOREIGN_COMMAND" not in err_s, f"(code={code_s})")
 
     # fail closed：重复键 / 非对象 / 无法定位 —— 必须退出码 6 或 3，且文件与备份都不变
     print("\n--- fail closed（禁止猜测）---")
