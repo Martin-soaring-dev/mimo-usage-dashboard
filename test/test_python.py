@@ -1657,8 +1657,10 @@ print(json.dumps(live, ensure_ascii=False))
         ping = json.loads(ping_text)
         check("ping 返回 200 且带固定 app 标识", ping.get("app") == U.LIVE_APP_ID, f"({ping})")
         check("ping 报告已知 kind", ping.get("kind") in U.KINDS, f"({ping.get('kind')})")
-        check("ping 只返回身份字段（没有多余信息可泄露）",
-              set(ping) == {"app", "kind"}, f"({ping})")
+        check("ping 只返回身份与能力字段（没有敏感信息）",
+              set(ping) == {"app", "kind", "requestSelection"}
+              and type(ping.get("requestSelection")) is int
+              and ping["requestSelection"] == 1, f"({ping})")
         check("ping 不回显 token", burls["token"] not in ping_text, f"({ping_text})")
         check("ping 不含数据库路径",
               "dbPath" not in ping_text and big_db not in ping_text and "bigcode" not in ping_text,
