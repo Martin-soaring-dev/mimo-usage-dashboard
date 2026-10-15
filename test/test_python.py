@@ -305,7 +305,17 @@ def main() -> int:
 
     # ---- 2. 上下文口径 ----
     print("\n=== 上下文口径 ===")
-    ctx = U.session_context(db)
+    # 上限解析会去读 ~/.config/mimocode/mimocode.jsonc。把 ~ 临时指向空目录，让
+    # 「内置表兜底」这条断言不依赖运行机器上是否存在该配置 —— CI 上没有它、开发者
+    # 机器上往往有，不隔离的话同一份代码在两种环境下会得出相反结果。
+    home_tmp = tempfile.mkdtemp(prefix="mimo-usage-home-")
+    real_expanduser = os.path.expanduser
+    U.os.path.expanduser = lambda p: home_tmp if p == "~" else real_expanduser(p)
+    try:
+        ctx = U.session_context(db)
+    finally:
+        U.os.path.expanduser = real_expanduser
+        cleanup_temp(home_tmp, "隔离 home 目录")
     check("ok=true", ctx.get("ok") is True)
     check("取最近活跃会话 s1", ctx["sessionId"] == "s1", f"({ctx.get('sessionId')})")
     check("占用取 step-finish = 2000", ctx["context"]["used"] == 2000, f"({ctx['context']['used']})")

@@ -201,11 +201,9 @@ def model_context_limit(model_id: str | None, provider_id: str | None = None,
         paths.append(os.path.join(directory, "mimocode.jsonc"))
         paths.append(os.path.join(directory, ".mimocode", "mimocode.jsonc"))
     resolved = None
-    found_config = False
     for path in paths:
         if not os.path.isfile(path):
             continue
-        found_config = True
         try:
             config = _read_jsonc_config(path)
         except (OSError, ValueError, UnicodeError):
@@ -215,8 +213,8 @@ def model_context_limit(model_id: str | None, provider_id: str | None = None,
             resolved = val
     if resolved is not None:
         return resolved, "config"
-    # Conservative legacy fallback for first-party MiMo models only.
-    if not found_config and provider_id == "xiaomi-token-plan-cn":
+    # First-party MiMo models keep their built-in window when no config declares one.
+    if provider_id == "xiaomi-token-plan-cn":
         known = MODEL_CONTEXT_LIMITS.get(str(model_id).lower())
         if known and str(model_id).lower().startswith("mimo-"):
             return known, "builtin"
