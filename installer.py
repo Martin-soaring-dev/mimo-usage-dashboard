@@ -82,6 +82,10 @@ MINIMUM_PYTHON = (3, 10)
 # 而这是引擎与运行期之间的协议常量，必须由引擎自己持有。
 KNOWN_KINDS = ("all", "token", "session", "context")
 
+# 运行期 `/{token}/api/ping` 返回的身份标识。同样必须由引擎自己持有，且与
+# usage_cli.py 的 LIVE_APP_ID 逐字一致（test/test_python.py 有断言守住）。
+LIVE_APP_ID = "mimo-usage-dashboard"
+
 
 class InstallerError(Exception):
     """致命错误：中止并（如已进入事务）回滚。"""
@@ -350,19 +354,22 @@ def valid_state_fields(st: dict):
     return port, token
 
 
-def looks_like_our_payload(payload) -> bool:
+def looks_like_our_ping(payload) -> bool:
+    """只看"端口上有 HTTP 服务在应答"不足以证明归属，必须命中项目标识与已知 kind。"""
     if not isinstance(payload, dict):
         return False
-    if payload.get("kind") not in KNOWN_KINDS:
+    if payload.get("app") != LIVE_APP_ID:
         return False
-    gen = payload.get("generatedAt")
-    if isinstance(gen, bool) or not isinstance(gen, int):
-        return False
-    return any(isinstance(payload.get(k), dict) for k in ("token", "session", "context"))
+    return payload.get("kind") in KNOWN_KINDS
 
 
 def service_status() -> dict:
-    """只读服务身份报告。安装器自己实现一份，避免依赖被安装脚本的版本。"""
+    """只读服务身份报告。安装器自己实现一份，避免依赖被安装脚本的版本。
+
+    身份探测走运行期的 `/{token}/api/ping`（常量时间）。**不能**用 `/api/report`：
+    它每次请求都做全量聚合，几十 MB 以上的库会超过这里的 1.2s 超时，把健康实例
+    误判成"不可达/陈旧状态"，安装与升级于是跳过优雅关闭继续写文件。
+    """
     status = {"statePresent": False, "stateValid": False, "reachable": False,
               "owned": False, "port": None, "pid": None, "tokenPrefix": None,
               "reason": "no_state"}
@@ -389,7 +396,7 @@ def service_status() -> dict:
     status["tokenPrefix"] = token[:6]
     pid = st.get("pid")
     status["pid"] = pid if (isinstance(pid, int) and not isinstance(pid, bool)) else None
-    url = f"http://127.0.0.1:{port}/{token}/api/report"
+    url = f"http://127.0.0.1:{port}/{token}/api/ping"
     import urllib.error
     import urllib.request
     try:
@@ -408,7 +415,7 @@ def service_status() -> dict:
     except (ValueError, UnicodeDecodeError):
         status["reason"] = "payload_not_json"
         return status
-    if looks_like_our_payload(payload):
+    if looks_like_our_ping(payload):
         status["owned"] = True
         status["reason"] = "ok"
     else:

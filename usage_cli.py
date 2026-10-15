@@ -73,6 +73,12 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
 
 KINDS = ("all", "token", "session", "context")
 
+# 实时服务的身份标识：`/{token}/api/ping` 用它证明监听者确实是本项目服务。
+# installer.py 出于同样的原因自带一份同名常量（面对的是可能被改动的已安装副本，
+# 不能导入本模块）。两份必须一致，由 test/test_python.py 的
+# 「身份标识与安装器一致」断言守住。
+LIVE_APP_ID = "mimo-usage-dashboard"
+
 KIND_TITLE = {
     "all": "MiMo Desktop 用量总览",
     "token": "MiMo Desktop Token 用量",
@@ -1779,6 +1785,7 @@ def build_command_hint(kind: str, days: int, out_path: str) -> str:
 # --open 时，拉起一个只监听 127.0.0.1 的极小只读 HTTP 服务：
 #   GET  /{token}/              → 自包含 HTML（嵌入 LIVE.reportUrl）
 #   GET  /{token}/api/report    → card_data JSON（无 dbPath）
+#   GET  /{token}/api/ping      → 固定身份标识（不读数据库；身份探测专用）
 #   POST /{token}/api/shutdown  → 退出服务（需 token + loopback Host）
 # 安全：随机 path token、仅 loopback、Host/Origin 校验、GET-only 数据面、
 # 空闲自动退出、不暴露数据库绝对路径。
@@ -1916,6 +1923,13 @@ class _UsageHandler(BaseHTTPRequestHandler):
             if rest == ["api", "report"]:
                 data = self._load()
                 self._json(200, _public_payload(data))
+                return
+            if rest == ["api", "ping"]:
+                # 常量时间响应：不读数据库、不返回路径、不回显 token。
+                # 身份探测必须与数据库规模无关 —— /api/report 每次请求都做全量聚合，
+                # 大库上远超探测超时，健康实例会被判为不可用（曾导致 --open 把自己
+                # 刚启动的子进程杀掉）。所以探测统一走这里。
+                self._json(200, {"app": LIVE_APP_ID, "kind": self.server.kind})  # type: ignore[attr-defined]
                 return
         except FileNotFoundError:
             # 不回传 str(exc)：其中含数据库绝对路径，token 持有者也不应拿到
@@ -2082,14 +2096,17 @@ def _fetch_json(url: str, timeout: float = 1.0):
         return None, "payload_not_json"
 
 
-def _looks_like_our_payload(payload) -> bool:
+def _looks_like_our_ping(payload) -> bool:
+    """ping 响应必须同时命中项目标识与已知 kind。
+
+    只看"端口上有 HTTP 服务在应答"不足以证明归属：共用一个端口号或恰好监听
+    同一端口的其它进程必须被判为**非本项目**，否则会去关掉别人的服务。
+    """
     if not isinstance(payload, dict):
         return False
-    if payload.get("kind") not in KINDS:
+    if payload.get("app") != LIVE_APP_ID:
         return False
-    if isinstance(payload.get("generatedAt"), bool) or not isinstance(payload.get("generatedAt"), int):
-        return False
-    return any(isinstance(payload.get(k), dict) for k in ("token", "session", "context"))
+    return payload.get("kind") in KINDS
 
 
 def _live_urls(port: int, token: str) -> dict:
@@ -2146,12 +2163,12 @@ def _service_probe() -> dict:
     status["token"] = token
     pid = st.get("pid")
     status["pid"] = pid if (isinstance(pid, int) and not isinstance(pid, bool)) else None
-    payload, err = _fetch_json(_live_urls(port, token)["reportUrl"], timeout=1.2)
+    payload, err = _fetch_json(_live_urls(port, token)["pageUrl"] + "api/ping", timeout=1.2)
     if err:
         status["reason"] = err
         return status
     status["reachable"] = True
-    if _looks_like_our_payload(payload):
+    if _looks_like_our_ping(payload):
         status["owned"] = True
         status["reason"] = "ok"
     else:
@@ -2375,8 +2392,8 @@ def wait_for_server(token: str, timeout: float = 8.0) -> dict | None:
             fields = _valid_state_fields(st)
             if fields is not None:
                 port, tok = fields
-                payload, err = _fetch_json(_live_urls(port, tok)["reportUrl"], timeout=1.2)
-                if err is None and _looks_like_our_payload(payload):
+                payload, err = _fetch_json(_live_urls(port, tok)["pageUrl"] + "api/ping", timeout=1.2)
+                if err is None and _looks_like_our_ping(payload):
                     return {**_live_urls(port, tok),
                             "pid": _state_pid(st), "reused": False}
         time.sleep(0.12)

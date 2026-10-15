@@ -149,7 +149,8 @@ img-src data: blob:; font-src data:; connect-src 'none'
 
 - `/usage` 仍生成**静态快照**（协议不变，stdout 一行路径）。
 - `--open` / `/usage-open` 会拉起**仅监听 127.0.0.1** 的只读服务（随机 path token、Host/Origin 校验、空闲退出），页面内「刷新数据」→ `GET /{token}/api/report` → 用新 JSON 重建 DOM。
-- API 只返回统计字段，不暴露数据库绝对路径；失败时页面保留上次成功数据。
+- 身份探测（`_service_probe` / `wait_for_server` / 安装器的 `service_status`）走 `GET /{token}/api/ping`：只回固定标识、**不读数据库**。早期版本用 `/api/report` 做探测，而它每次请求都做全量聚合——20MB 以上的库聚合就超过探测的 1.2s 超时，健康实例被判为不可达，`--open` 会把自己刚启动的子进程杀掉并返回 None（v0.3 已修）。
+- API 只返回统计字段，不暴露数据库绝对路径；ping 只回 `{app, kind}`。失败时页面保留上次成功数据。
 
 ## 5. 命令参数安全边界
 

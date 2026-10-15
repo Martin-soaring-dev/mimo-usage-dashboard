@@ -207,6 +207,49 @@ def make_rich_db(path: str, days: int = 420) -> None:
     conn.close()
 
 
+def make_big_db(path: str, messages: int = 28000) -> None:
+    """造一个 20MB 以上的合成库（纯合成数据，只用于"大库"回归）。
+
+    存在的理由：实时服务的身份探测曾经走 `/api/report`，而它**每次请求都做全量
+    聚合** —— 库越大越慢，20MB 左右就超过探测的 1.2s 超时，健康实例会被判成
+    "不可达/陈旧状态"（详见「大库下的实时服务启动」一节）。这个 fixture 让回归
+    测试跑在确实会触发原故障的规模上，而不是小库上"看起来没问题"。
+    """
+    tools = ("read", "write", "bash", "edit", "grep")
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_SQL)
+    now_ms = int(time_module.time() * 1000)
+    conn.execute(
+        "INSERT INTO session (id,title,directory,time_created,time_updated,"
+        "summary_additions,summary_deletions,summary_files) VALUES (?,?,?,?,?,?,?,?)",
+        ("s-big", "大库会话", "D:/proj/big", now_ms - 86_400_000, now_ms, 10, 4, 1),
+    )
+    for i in range(messages):
+        mid = f"bm{i}"
+        ts = now_ms - i * 1000
+        tokens = {"input": 400, "output": 120, "reasoning": 30,
+                  "cache": {"read": 900, "write": 40}}
+        tokens["total"] = (tokens["input"] + tokens["output"] + tokens["reasoning"]
+                           + tokens["cache"]["read"] + tokens["cache"]["write"])
+        conn.execute(
+            "INSERT INTO message (id,session_id,time_created,time_updated,data) "
+            "VALUES (?,?,?,?,?)",
+            (mid, "s-big", ts, ts, json.dumps(
+                {"role": "assistant", "providerID": "xiaomi-token-plan-cn",
+                 "modelID": "mimo-v2.6-flash", "time": {"created": ts}, "tokens": tokens})),
+        )
+        for p in range(5):
+            data = ({"type": "step-finish", "tokens": tokens} if p == 0
+                    else {"type": "tool", "tool": tools[p % len(tools)]})
+            conn.execute(
+                "INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) "
+                "VALUES (?,?,?,?,?,?)",
+                (f"bp{i}-{p}", mid, "s-big", ts, ts, json.dumps(data)),
+            )
+    conn.commit()
+    conn.close()
+
+
 def main() -> int:
     import time
 
@@ -1492,6 +1535,272 @@ print(json.dumps(live, ensure_ascii=False))
             os.environ.pop("MIMO_USAGE_DATA_DIR", None)
         else:
             os.environ["MIMO_USAGE_DATA_DIR"] = old_data_env
+
+    # ---- P0 回归：大库下的实时服务启动 ----
+    #  曾经：ensure_live_server / _service_probe 用 `/api/report` 判身份，而该端点
+    #  每次请求都做全量聚合 —— 20MB 左右的库聚合就要约 2s，远超探测的 1.2s 超时，
+    #  于是健康实例被判成"不可达/陈旧状态"：刚 spawn 的子进程被 kill、返回 None，
+    #  并留下指向死进程的 live-server.json。现在身份探测走 `/{token}/api/ping`
+    #  （常量时间、不读库），所以下面的断言与库规模无关。
+    print("\n=== 大库下的实时服务启动（回归） ===")
+    import http.server as _hs
+    import socket as _bsock
+    import installer as _installer
+
+    big_dir = os.path.join(tmpdir, "big-live")
+    os.makedirs(big_dir, exist_ok=True)
+    big_db = os.path.join(big_dir, "bigcode.db")
+    make_big_db(big_db)
+    big_mb = os.path.getsize(big_db) / (1 << 20)
+    check("大库 fixture 超过 20MB（覆盖原故障规模）", big_mb > 20, f"({big_mb:.1f}MB)")
+    check("身份标识与安装器一致（协议常量不漂移）",
+          U.LIVE_APP_ID == _installer.LIVE_APP_ID,
+          f"(usage_cli={U.LIVE_APP_ID}, installer={_installer.LIVE_APP_ID})")
+
+    # 替身：数 card_data 被调用几次。用"探测有没有做聚合"来证明它是常量时间，
+    # 而不是断言毫秒级耗时（耗时随机器漂移，也会掩盖真正的机制）。
+    _real_card_data = U.card_data
+    _agg = {"n": 0}
+
+    def _counting_card_data(*args, **kwargs):
+        _agg["n"] += 1
+        return _real_card_data(*args, **kwargs)
+
+    U.card_data = _counting_card_data
+
+    old_data_big = os.environ.get("MIMO_USAGE_DATA_DIR")
+    big_data = os.path.join(tmpdir, "big-live-data")
+    os.makedirs(big_data, exist_ok=True)
+    big_spawn_data = os.path.join(tmpdir, "big-live-spawn")
+    os.makedirs(big_spawn_data, exist_ok=True)
+    os.environ["MIMO_USAGE_DATA_DIR"] = big_data
+    bhttpd = None
+    e2e_live = None
+    try:
+        # ---- A. 端点契约：ping 给出固定身份，且不回显 token / 不含库路径 ----
+        bhttpd = U.create_usage_server(big_db, idle_minutes=10)
+        burls = U.live_urls(bhttpd)
+        bping_url = burls["pageUrl"] + "api/ping"
+        bt = _th.Thread(target=bhttpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        bt.start()
+
+        with _ureq.urlopen(bping_url, timeout=5) as resp:
+            ping_text = resp.read().decode("utf-8")
+        ping = json.loads(ping_text)
+        check("ping 返回 200 且带固定 app 标识", ping.get("app") == U.LIVE_APP_ID, f"({ping})")
+        check("ping 报告已知 kind", ping.get("kind") in U.KINDS, f"({ping.get('kind')})")
+        check("ping 只返回身份字段（没有多余信息可泄露）",
+              set(ping) == {"app", "kind"}, f"({ping})")
+        check("ping 不回显 token", burls["token"] not in ping_text, f"({ping_text})")
+        check("ping 不含数据库路径",
+              "dbPath" not in ping_text and big_db not in ping_text and "bigcode" not in ping_text,
+              f"({ping_text})")
+
+        # ---- B. 关键证明：ping 不做全量聚合；/api/report 才是聚合路径 ----
+        _agg["n"] = 0
+        with _ureq.urlopen(bping_url, timeout=5) as resp:
+            resp.read()
+        check("ping 不触发全量聚合（card_data 调用 0 次）", _agg["n"] == 0, f"(calls={_agg['n']})")
+
+        _agg["n"] = 0
+        with _ureq.urlopen(burls["reportUrl"], timeout=120) as resp:
+            resp.read()
+        check("（对照）/api/report 确实触发聚合（替身可观测）", _agg["n"] >= 1, f"(calls={_agg['n']})")
+
+        # ---- C. 身份探测在 20MB+ 库上仍能确认实例，且不聚合 ----
+        U.write_server_state({
+            "pid": os.getpid(), "port": burls["port"], "token": burls["token"],
+            "pageUrl": burls["pageUrl"], "reportUrl": burls["reportUrl"],
+            "db": big_db, "kind": "all", "days": 30,
+            "startedAt": int(time_module.time() * 1000), "idleMinutes": 10,
+        })
+        _agg["n"] = 0
+        probe = U._service_probe()
+        check("大库实例：身份三态全过（stateValid/reachable/owned）",
+              probe["stateValid"] and probe["reachable"] and probe["owned"], f"({probe})")
+        check("身份探测本身不触发全量聚合", _agg["n"] == 0, f"(calls={_agg['n']})")
+
+        _agg["n"] = 0
+        wlive = U.wait_for_server(burls["token"])
+        check("大库实例：wait_for_server 能确认身份",
+              isinstance(wlive, dict) and wlive.get("port") == burls["port"], f"({wlive})")
+        check("wait_for_server 不触发全量聚合", _agg["n"] == 0, f"(calls={_agg['n']})")
+
+        # 安装器自带一份探针，同样不能聚合
+        _agg["n"] = 0
+        ist = _installer.service_status()
+        check("安装器探测：大库实例判为 owned",
+              ist["stateValid"] and ist["reachable"] and ist["owned"], f"({ist})")
+        check("安装器探测不触发全量聚合", _agg["n"] == 0, f"(calls={_agg['n']})")
+
+        # ---- D. ping 的安全边界与数据面一致（不是绕过鉴权的公开端点）----
+        bad_tok = bping_url.replace(burls["token"], "AAAAAAAAAAAAAAAAAAAAAA")
+        for label, url in (("ping：错误 token 被拒绝", bad_tok),
+                           ("ping：缺失 token 被拒绝",
+                            f"http://{U.LOOPBACK_HOST}:{burls['port']}/api/ping")):
+            try:
+                _ureq.urlopen(url, timeout=5)
+                check(label, False)
+            except _uerr.HTTPError as e:
+                check(label, e.code == 404, f"(code={e.code})")
+
+        for origin in ("null", "http://evil.example",
+                       f"http://127.0.0.1:{burls['port'] + 1}"):
+            req_bad_origin = _ureq.Request(bping_url, headers={"Origin": origin})
+            try:
+                _ureq.urlopen(req_bad_origin, timeout=5)
+                check(f"ping：Origin {origin} 被拒绝", False)
+            except _uerr.HTTPError as e:
+                check(f"ping：Origin {origin} 被拒绝", e.code == 403, f"(code={e.code})")
+
+        req_ok_origin = _ureq.Request(
+            bping_url, headers={"Origin": f"http://127.0.0.1:{burls['port']}"})
+        with _ureq.urlopen(req_ok_origin, timeout=5) as resp:
+            check("ping：同源 loopback Origin 放行", resp.status == 200)
+
+        # 非 loopback Host → 403（raw socket，绕过 urllib 对 Host 的重写）
+        raw_b = _bsock.create_connection((U.LOOPBACK_HOST, burls["port"]), 2)
+        try:
+            raw_b.sendall(
+                (f"GET /{burls['token']}/api/ping HTTP/1.1\r\n"
+                 f"Host: evil.example:{burls['port']}\r\nConnection: close\r\n\r\n").encode("ascii")
+            )
+            resp_raw = b""
+            while True:
+                chunk = raw_b.recv(4096)
+                if not chunk:
+                    break
+                resp_raw += chunk
+            check("ping：非 loopback Host 被拒绝",
+                  b" 403 " in resp_raw.split(b"\r\n", 1)[0],
+                  f"({resp_raw.split(b'\r\n', 1)[0]!r})")
+        finally:
+            raw_b.close()
+
+        # POST ping → 404：数据面仍然只认 GET
+        req_post_ping = _ureq.Request(bping_url, method="POST", data=b"")
+        try:
+            _ureq.urlopen(req_post_ping, timeout=5)
+            check("ping：POST 被拒绝（数据面仍为 GET-only）", False)
+        except _uerr.HTTPError as e:
+            check("ping：POST 被拒绝（数据面仍为 GET-only）", e.code == 404, f"(code={e.code})")
+
+        # ---- E. 陌生监听者：可访问但不是本项目 → 不认领、不关闭、不杀 ----
+        foreign_seen: list = []
+
+        class _ForeignHandler(_hs.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                return
+
+            def _reply(self):
+                foreign_seen.append(self.path)
+                body = json.dumps({"hello": "not-the-dashboard"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = _reply
+            do_POST = _reply
+
+        fhttpd = _hs.ThreadingHTTPServer((U.LOOPBACK_HOST, 0), _ForeignHandler)
+        fport = fhttpd.server_address[1]
+        ft = _th.Thread(target=fhttpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        ft.start()
+        try:
+            U.write_server_state({
+                "pid": os.getpid(), "port": fport, "token": "FOREIGNTOKEN000000",
+                "pageUrl": f"http://{U.LOOPBACK_HOST}:{fport}/FOREIGNTOKEN000000/",
+                "reportUrl": f"http://{U.LOOPBACK_HOST}:{fport}/FOREIGNTOKEN000000/api/report",
+                "db": big_db, "kind": "all", "days": 30,
+                "startedAt": int(time_module.time() * 1000), "idleMinutes": 10,
+            })
+            fprobe = U._service_probe()
+            check("陌生监听者：可访问但 owned=False（不凭端口认领）",
+                  fprobe["stateValid"] and fprobe["reachable"] and not fprobe["owned"],
+                  f"({fprobe})")
+            check("陌生监听者：try_reuse_server 拒绝复用", U.try_reuse_server(big_db) is None)
+            check("陌生监听者：未被本项目协议关闭（没收到任何 shutdown 请求）",
+                  not any("shutdown" in p for p in foreign_seen), f"({foreign_seen})")
+        finally:
+            fhttpd.shutdown()
+            fhttpd.server_close()
+            ft.join(timeout=2)
+
+        # ---- F. 端到端：大库上真实 spawn 子进程并复用（独立数据目录）----
+        bhttpd.shutdown()
+        bhttpd.server_close()
+        bt.join(timeout=2)
+        bhttpd = None
+        os.environ["MIMO_USAGE_DATA_DIR"] = big_spawn_data
+
+        e2e_live = U.ensure_live_server(big_db, idle_minutes=5)
+        check("大库：ensure_live_server 返回 live（原代码此处为 None）",
+              isinstance(e2e_live, dict) and bool(e2e_live.get("token")), f"({e2e_live})")
+        if isinstance(e2e_live, dict):
+            check("大库：启动的子进程仍存活（没有被自己杀掉）",
+                  U._pid_alive(int(e2e_live["pid"] or 0)), f"(pid={e2e_live.get('pid')})")
+            with _ureq.urlopen(e2e_live["reportUrl"], timeout=120) as resp:
+                check("大库：/api/report 数据面不受影响", resp.status == 200)
+            reuse = U.ensure_live_server(big_db, idle_minutes=5)
+            check("大库：第二次调用复用同一实例（不重复 spawn）",
+                  isinstance(reuse, dict) and reuse.get("reused") is True
+                  and reuse.get("token") == e2e_live.get("token")
+                  and reuse.get("pid") == e2e_live.get("pid"), f"({reuse})")
+
+        # ---- G. 启动失败路径：锁与状态文件仍被正确清理 ----
+        fail_data = os.path.join(tmpdir, "big-live-fail")
+        os.makedirs(fail_data, exist_ok=True)
+        os.environ["MIMO_USAGE_DATA_DIR"] = fail_data
+        orig_spawn = U.spawn_serve_child
+        try:
+            def _boom_spawn(*_a, **_kw):
+                raise OSError("simulated spawn failure")
+
+            U.spawn_serve_child = _boom_spawn
+            failed = U.ensure_live_server(big_db, idle_minutes=5)
+            check("spawn 失败时返回 None", failed is None, f"({failed})")
+            check("spawn 失败后启动锁已释放", not os.path.exists(U._lock_path()),
+                  f"({U._lock_path()})")
+            check("spawn 失败后没有留下状态文件",
+                  not os.path.exists(os.path.join(fail_data, "live-server.json")))
+        finally:
+            U.spawn_serve_child = orig_spawn
+    finally:
+        U.card_data = _real_card_data
+        if bhttpd is not None:
+            try:
+                bhttpd.shutdown()
+                bhttpd.server_close()
+            except Exception:
+                pass
+        # 收掉本节点起来的子进程（只用本项目协议；失败才兜底 kill 自己 spawn 的 pid）
+        os.environ["MIMO_USAGE_DATA_DIR"] = big_spawn_data
+        st_big = U.read_server_state()
+        if st_big and st_big.get("token"):
+            try:
+                req_sd_big = _ureq.Request(
+                    f"http://{U.LOOPBACK_HOST}:{int(st_big['port'])}/"
+                    f"{st_big['token']}/api/shutdown", method="POST", data=b"")
+                with _ureq.urlopen(req_sd_big, timeout=5) as resp:
+                    check("大库：服务接受 shutdown", resp.status == 200)
+            except Exception as ex:
+                check("大库：服务接受 shutdown", False, f"({ex})")
+            for _ in range(25):
+                if not U._pid_alive(int(st_big.get("pid") or 0)):
+                    break
+                time_module.sleep(0.2)
+            if U._pid_alive(int(st_big.get("pid") or 0)):
+                try:
+                    os.kill(int(st_big["pid"]), 9)
+                except Exception:
+                    pass
+        U.clear_server_state()
+        if old_data_big is None:
+            os.environ.pop("MIMO_USAGE_DATA_DIR", None)
+        else:
+            os.environ["MIMO_USAGE_DATA_DIR"] = old_data_big
 
     # ---- P0 回归：selfcheck 必须零副作用（不读库、不写文件、无库也能通过）----
     #  安装器用它验证"这份 usage_cli.py 能被目标解释器启动"，所以它绝不能有任何
