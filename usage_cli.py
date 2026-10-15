@@ -1161,7 +1161,7 @@ function tokenCard(t){
     { k: '工具调用', v: fmtInt(tot.tools) },
     // 会话数来自 session 表全量行数，不随窗口变化；这里显式标注，避免与窗口内数字混淆。
     { k: '会话数', v: fmtInt(tot.sessions), t: '全部会话总数，不随时间尺度变化' },
-    { k: '平均每次请求', v: fmt(num(tot.requests) ? num(tot.tokens) / num(tot.requests) : 0) + ' tok' }
+    { k: '平均每次请求（tokens）', v: fmt(num(tot.requests) ? num(tot.tokens) / num(tot.requests) : 0) }
   ].map(function(c){
     return '<div class="card"' + (c.t ? ' title="' + esc(c.t) + '"' : '') + '><div class="num">' +
       c.v + '</div><div class="lb">' + c.k + '</div></div>';
