@@ -22,3 +22,6 @@ venv/
 # 生成的用量页面（脚本默认输出到工作目录）
 mimo-usage-*.html
 outputs/
+
+# 本地 AI 助手的工作记忆，仅保留在本机
+.workbuddy/
