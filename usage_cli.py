@@ -1283,11 +1283,13 @@ function treeKids(branch, path, collapsed){
   var total = num(branch && branch.total);
   var unit = String((branch && branch.unit) || "");
   var hid = collapsed ? " hidden" : "";
+  // 统计口径说明属于对应分支的折叠内容，不能成为树节点的常驻兄弟行。
+  var note = branch && branch.note ? '<div class="tnote">' + esc(branch.note) + '</div>' : '';
   if (!kids.length){
     return '<div class="tkids" id="' + path + '" role="group"' + hid + '>' +
-      '<div class="tnote">（无可细分的子项）</div></div>';
+      note + '<div class="tnote">（无可细分的子项）</div></div>';
   }
-  return '<div class="tkids" id="' + path + '" role="group"' + hid + '>' + kids.map(function(c){
+  return '<div class="tkids" id="' + path + '" role="group"' + hid + '>' + note + kids.map(function(c){
     var v = num(c && c.value);
     return '<div class="trow tchild" role="treeitem" aria-level="2" data-leaf="' +
         esc(c && c.label) + '" data-value="' + v + '">' +
@@ -1316,7 +1318,6 @@ function contextTree(bd){
       '<span class="tl">' + esc(b.label) + '</span>' +
       '<span class="tu muted small">' + esc(b.unit) + '</span>' +
       '<span class="tv">' + fmt(b.total) + '</span></div>' +
-      '<div class="tnote">' + esc(b.note) + '</div>' +
       treeKids(b, path, !open);
   }).join("");
   var na = (bd && bd.notSubdividable) || {};

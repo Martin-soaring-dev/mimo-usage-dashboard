@@ -496,6 +496,16 @@ const treePayload = (branches) => ({
       attrOf(r, "aria-expanded") === "false")
     && (html.match(/class="tkids"[^>]*\bhidden\b/g) || []).length === 4
     && !/class="tw"[^>]*>▾</.test(html));
+  check("Issue #9：说明文字只位于 hidden 的子项容器内",
+    branches.every((b, i) => {
+      const start = html.indexOf('id="tk-' + i + '" role="group" hidden>');
+      const next = html.indexOf('id="tk-' + (i + 1) + '" role="group" hidden>');
+      const segment = html.slice(start, next < 0 ? undefined : next);
+      return start >= 0 && segment.includes('<div class="tnote">' + b.note + '</div>');
+    }) && !/<\/div><div class="tnote">[^<]*<\/div><div class="tkids"/.test(html));
+  check("Issue #9：无子项分支的说明仍可展开查看",
+    /id="tk-0" role="group" hidden><div class="tnote">说明文本<\/div>/.test(
+      render(sb, "context", treePayload([{label:"空分支",unit:"tokens",note:"说明文本",total:0,children:[]}]))));
   check("三种单位分别标注", ["tokens", "次", "条"].every((u) => html.includes('data-unit="' + u + '"')));
   check("子项带 data-leaf/data-value 便于核对",
     (html.match(/data-leaf="/g) || []).length === branches.reduce((a, b) => a + b.children.length, 0));
