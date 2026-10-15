@@ -2039,7 +2039,7 @@ class _UsageHandler(BaseHTTPRequestHandler):
                 # 身份探测必须与数据库规模无关 —— /api/report 每次请求都做全量聚合，
                 # 大库上远超探测超时，健康实例会被判为不可用（曾导致 --open 把自己
                 # 刚启动的子进程杀掉）。所以探测统一走这里。
-                self._json(200, {"app": LIVE_APP_ID, "kind": self.server.kind})  # type: ignore[attr-defined]
+                self._json(200, {"app": LIVE_APP_ID, "kind": self.server.kind, "requestSelection": 1})  # type: ignore[attr-defined]
                 return
         except ValueError:
             self._json(400, {"error": "invalid_query"})
@@ -2470,6 +2470,14 @@ def try_reuse_server(db: str) -> dict | None:
         if status["stateValid"] and status["reachable"] and not status["owned"]:
             print("提示：live-server.json 指向的监听者不是本项目服务，已忽略该状态文件（未做任何强制动作）。",
                   file=sys.stderr)
+        return None
+    # v0.2.0 servers do not understand request-scoped session selection.
+    # Only shut down an instance proven to be ours; otherwise a new caller could
+    # silently receive another session's context from the old process.
+    ping, ping_err = _fetch_json(_live_urls(status["port"], status["token"])["pageUrl"] + "api/ping", timeout=1.2)
+    if ping_err or not isinstance(ping, dict) or ping.get("requestSelection") != 1:
+        if not ping_err and _looks_like_our_ping(ping):
+            _request_shutdown(status["port"], status["token"])
         return None
     st = read_server_state() or {}
     recorded_db = st.get("db")
