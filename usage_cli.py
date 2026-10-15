@@ -125,7 +125,7 @@ def default_data_dir() -> str:
 
 
 def _read_jsonc_config(path: str) -> dict:
-    """Read a JSONC file without altering it. This installed script is standalone."""
+    """Read JSONC without modifying the configuration file."""
     with open(path, encoding="utf-8-sig") as stream:
         source = stream.read()
     result = []
@@ -135,7 +135,7 @@ def _read_jsonc_config(path: str) -> dict:
         ch = source[i]
         if quoted:
             result.append(ch)
-            if ch == "\\\\" and i + 1 < len(source):
+            if ch == "\\" and i + 1 < len(source):
                 result.append(source[i + 1])
                 i += 2
                 continue
@@ -149,7 +149,7 @@ def _read_jsonc_config(path: str) -> dict:
             i += 1
             continue
         if source.startswith("//", i):
-            while i < len(source) and source[i] not in "\\r\\n":
+            while i < len(source) and source[i] not in "\r\n":
                 i += 1
             continue
         if source.startswith("/*", i):
@@ -160,7 +160,7 @@ def _read_jsonc_config(path: str) -> dict:
             continue
         result.append(ch)
         i += 1
-    clean = re.sub(r",(\\s*[}\\]])", r"\\1", "".join(result))
+    clean = re.sub(r",(\s*[}\]])", r"\1", "".join(result))
     obj = json.loads(clean)
     if not isinstance(obj, dict):
         raise ValueError("JSONC config root must be an object")
