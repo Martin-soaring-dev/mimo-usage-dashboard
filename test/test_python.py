@@ -316,6 +316,15 @@ def main() -> int:
     finally:
         U.os.path.expanduser = real_expanduser
         cleanup_temp(home_tmp, "隔离 home 目录")
+    # Issue #4: explicit selection must never silently switch to the newest session.
+    check("Issue #4：默认模式为 latest", ctx.get("selectionMode") == "latest")
+    fixed = U.session_context(db, session_id="s2")
+    check("Issue #4：指定 s2 保持固定模式",
+          fixed.get("sessionId") == "s2" and fixed.get("selectionMode") == "fixed")
+    missing = U.session_context(db, session_id="does-not-exist")
+    check("Issue #4：无效显式会话不回退到最新",
+          missing.get("ok") is False and missing.get("selectionMode") == "fixed"
+          and missing.get("sessionId") == "does-not-exist")
     check("ok=true", ctx.get("ok") is True)
     check("取最近活跃会话 s1", ctx["sessionId"] == "s1", f"({ctx.get('sessionId')})")
     check("占用取 step-finish = 2000", ctx["context"]["used"] == 2000, f"({ctx['context']['used']})")
