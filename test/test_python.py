@@ -1275,6 +1275,28 @@ def main() -> int:
             check("API 返回统计字段", all(k in got for k in ("kind", "token", "session", "context")))
             check("API 不泄露 dbPath", "dbPath" not in got)
 
+            # Issue #4: concurrent dashboard URLs must not inherit one global session.
+            from urllib.parse import urlencode as _qencode
+            def _report_for(**query):
+                with _ureq.urlopen(urls["reportUrl"] + "?" + _qencode(query), timeout=3) as rsp:
+                    return json.loads(rsp.read().decode("utf-8"))
+            a = _report_for(session="s1", days=7)
+            b = _report_for(session="s2", days=30)
+            a_again = _report_for(session="s1", days=7)
+            check("Issue #4：两个页面固定不同会话",
+                  a["context"]["sessionId"] == "s1" and b["context"]["sessionId"] == "s2"
+                  and a_again["context"]["sessionId"] == "s1")
+            check("Issue #4：各请求保留 days", a["token"]["windowKeys"] and "7" in a["token"]["windowKeys"])
+            check("Issue #4：固定查询带 selectionMode",
+                  a["context"]["selectionMode"] == b["context"]["selectionMode"] == "fixed")
+            invalid = _report_for(session="unknown-session")
+            check("Issue #4：API 缺失会话不降级",
+                  invalid["context"].get("ok") is False)
+            with _ureq.urlopen(urls["pageUrl"] + "?session=s1&days=7", timeout=3) as resp:
+                fixed_html = resp.read().decode("utf-8")
+            check("Issue #4：页面刷新 URL 保留会话选择",
+                  "session=s1&amp;days=7" in fixed_html or "session=s1&days=7" in fixed_html)
+
             with _ureq.urlopen(urls["pageUrl"], timeout=3) as resp:
                 page = resp.read().decode("utf-8")
             check("页面嵌入 LIVE.reportUrl", urls["reportUrl"] in page)
