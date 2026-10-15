@@ -47,7 +47,7 @@ the text — exactly the kind of deterministic local function that qwen code's `
 |---|---|---|
 | `/usage` mechanism | skill → AI understands → AI calls tool → AI pastes result | `command` + local shell substitution |
 | AI involvement | required (two hops) | **relays one line only** |
-| Server | always-on `127.0.0.1:8790` | **none** |
+| Server | always-on `127.0.0.1:8790` | **none by default**; `/usage-open` starts an on-demand loopback-only read-only server |
 | Inline card | `sci-widget` (AI writes HTML) | static HTML file |
 | Runtime | Node ≥ 22 | **Python ≥ 3.10 (stdlib only)** |
 
