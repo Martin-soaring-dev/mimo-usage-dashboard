@@ -143,65 +143,30 @@ img-src data: blob:; font-src data:; connect-src 'none'
 - **流式占位**：`isSciWidget(lang) ? (streaming ? <Loading/> : <Iframe/>)`
   ⇒ 只要 HTML 由 AI 逐字输出，就会看到「正在生成交互演示…」
 
-### 4.3 结论
+### 4.3 结论（v0.3 页内刷新修订）
 
-放弃 `sci-widget` 与常驻服务，改为**静态 HTML 文件**：
-输出稳定、零 token、可反复打开、可归档、不占端口。
+静态 HTML 无法在页内重读 SQLite；宿主也没有「刷新已打开页面」的接口。因此：
 
-## 5. 命令注入防护
+- `/usage` 仍生成**静态快照**（协议不变，stdout 一行路径）。
+- `--open` / `/usage-open` 会拉起**仅监听 127.0.0.1** 的只读服务（随机 path token、Host/Origin 校验、空闲退出），页面内「刷新数据」→ `GET /{token}/api/report` → 用新 JSON 重建 DOM。
+- 身份探测（`_service_probe` / `wait_for_server` / 安装器的 `service_status`）走 `GET /{token}/api/ping`：只回固定标识、**不读数据库**。早期版本用 `/api/report` 做探测，而它每次请求都做全量聚合——20MB 以上的库聚合就超过探测的 1.2s 超时，健康实例被判为不可达，`--open` 会把自己刚启动的子进程杀掉并返回 None（v0.3 已修）。
+- API 只返回统计字段，不暴露数据库绝对路径；ping 只回 `{app, kind}`。失败时页面保留上次成功数据。
 
-因为 `$ARGUMENTS` 会被拼进 shell 命令行，采用**双层防护**。
+## 5. 命令参数安全边界
 
-### 5.1 第一层：模板用 PowerShell 单引号包裹
+引擎先对 command 模板做 `$ARGUMENTS` 文本替换，再扫描并执行 `!` 反引号命令。因而，模板中的引号不是可靠的转义层：含单引号的输入可能提前结束 PowerShell 单引号字符串，在 Python 脚本启动前执行额外 shell 语句。
 
-模板写成：
+当前注册器采用 fail-closed 设计：
 
-```
-!`<python> <script> --arg-string '$ARGUMENTS'`
-```
+- `/usage` 运行固定的 `usage_cli.py` 总览命令。
+- `/usage-open` 运行固定的 `usage_cli.py --open` 命令。
+- 两个模板都不包含 `$ARGUMENTS` 或动态参数拼接。
+- 需要筛选 `token`、`session`、`context` 或日期范围时，直接运行本地 CLI，而不是把用户输入嵌入 shell 模板。
+- CLI 对 `--db` 与 `--out` 路径允许 Windows 反斜杠；遇到非法或缺失的路径参数时明确报错，不能静默丢弃并回退到默认数据库。
 
-`` `$ARGUMENTS` `` **必须**用**单引号**包裹。三种写法的实测差异：
+旧版本曾用单引号包裹 `$ARGUMENTS`，并根据分号等字符测试注入。这些测试不能排除单引号闭合攻击，因此不能作为通用安全保证。当前固定命令设计刻意牺牲 slash 命令的动态筛选能力，以消除这条 shell 插值攻击面。
 
-| 写法 | 用户输入 `token ; echo x` | 用户输入 `--out "C:\a b\x.html"` |
-|---|---|---|
-| 裸接 `$ARGUMENTS` | ❌ PowerShell 把 `;` 当语法，**整行解析失败** | ✅ 可用 |
-| 双引号 `"$ARGUMENTS"` | ✅ 拦住 | ❌ 内层 `"` 提前闭合，**参数被截断** |
-| **单引号 `'$ARGUMENTS'`** | ✅ **字面文本，shell 层不解释** | ✅ **内部双引号原样保留** |
-
-Windows 上 `shell.preferred()` 选中 PowerShell，而 PowerShell 的 `'...'` 是
-**字面字符串**（不做变量展开、不解释分号与 `&&`），所以注入面在 shell 层即被堵死。
-
-> ⚠️ **踩坑记录**：早期版本用 `--arg-string "$ARGUMENTS"`，在
-> `--out "C:\Users\x\a b\y.html"` 这类输入下引号会提前闭合，`--out` 被静默丢弃、
-> 回落到默认路径。裸接则会让含 `;` 的输入直接令 PowerShell 报语法错。
-> 只有单引号同时满足两侧。
-
-### 5.2 第二层：脚本白名单（`_sanitize_args`）
-
-`--arg-string` 之后的所有 argv 元素拼回整串，再用**自写的引号拆分器**解析
-（不用 `shlex` —— `posix=True` 会把 Windows 路径的 `\` 当转义符吞掉，
-`posix=False` 又不处理嵌套引号），随后逐个过滤：
-
-- 含 `; | & $ \` > < \n \r \` 的 token 一律丢弃
-- 只放行已知 kind（`all|token|session|context`）与已知选项
-  （`--days --db --out --session --limit --open --print-path`）
-- **例外**：`--out` 的值允许含 `\`（Windows 路径必需），但仍拒绝 `; | & $ \` >`
-- 未知选项 / 未知 kind 全部丢弃
-
-实测：输入 `token ; echo pwned` → 白名单后只剩 `['token']`，恶意部分全部丢弃。
-
-测试见：
-- `test/test_python.py`「参数白名单」（9 项断言）
-- `test/e2e_live.py`「注入防护（真实路径）」（真实跑一遍 PowerShell）
-
-### 5.3 已知限制
-
-PowerShell 在把参数传给外部程序时**会剥掉内层双引号**，因此
-`--arg-string 'token --out "C:\a b\x.html"'` 到达脚本时双引号已消失，
-含空格路径会散架。实际场景不受影响：
-
-- 用户通常**不传** `--out`，走 `default_out_path()`（默认当前目录）；
-- 默认路径与 `~/.config/mimocode/` 均不含空格。
+测试覆盖：`test/test_python.py` 验证 Windows 数据库路径与非法值拒绝；`test/command-e2e.mjs` 验证注册模板不包含动态参数占位符，并检查固定命令可生成 HTML。真实 MiMo/PowerShell 环境仍应在发布前验收。
 
 ## 6. 复核方法
 

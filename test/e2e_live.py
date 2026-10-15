@@ -86,7 +86,8 @@ if matches:
         check("HTML 内联数据", "var DATA" in html)
         check("kind=token 生效", '"kind": "token"' in html or '"kind":"token"' in html)
         check("days=7 生效", '"days": 7' in html or '"days":7' in html)
-        check("HTML 自包含（无 fetch）", not re.search(r"(^|[^a-zA-Z])fetch\(", html))
+        # 静态路径：LIVE 必须是 null。运行时可含 refreshData/fetch 定义，但未启用。
+        check("静态 HTML 的 LIVE=null（未附着实时服务）", "var LIVE = null" in html)
 
 print("\n=== 注入防护（真实路径）===")
 # 恶意输入含 `;` / `&&`。模板用 PowerShell 单引号包裹 $ARGUMENTS，

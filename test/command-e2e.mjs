@@ -16,11 +16,13 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { stripJsonc, buildUsageTemplate } from "./helpers.mjs";
+import { fileURLToPath } from "node:url";
+import { buildUsageTemplate } from "./helpers.mjs";
 
 const PY = process.env.MIMO_USAGE_PY
-  || "C:/Users/Martin/.workbuddy/binaries/python/versions/3.13.12/python.exe";
-const SCRIPT = path.resolve("usage_cli.py");
+  || process.env.PYTHON
+  || (process.platform === "win32" ? "python" : "python3");
+const SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "usage_cli.py");
 
 let failures = 0;
 const check = (name, ok, extra = "") => {
@@ -59,8 +61,8 @@ let CAN_SPAWN = true;
 function runPy(args) {
   if (!CAN_SPAWN) return "";
   try {
-    // 经 cmd /c 包装调用，兼容 Windows 路径
-    return execFileSync("cmd", ["/c", PY, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    // 直接调用解释器，避免 cmd /c 仅适用于 Windows，确保 CI/Linux 可运行。
+    return execFileSync(PY, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (err) {
     if (err && (err.code === "EBUSY" || err.code === "EPERM" || err.code === "EACCES")) {
       CAN_SPAWN = false;
@@ -72,19 +74,12 @@ function runPy(args) {
 }
 
 console.log("=== 模板形状 ===");
-const cfgPath = path.join(os.homedir(), ".config", "mimocode", "mimocode.jsonc");
-let template;
-if (fs.existsSync(cfgPath)) {
-  const cfg = JSON.parse(stripJsonc(fs.readFileSync(cfgPath, "utf8")));
-  template = cfg?.command?.usage?.template;
-}
-if (!template) {
-  console.log("  (配置中未找到 command.usage，使用内存模板做形状校验)");
-  template = buildUsageTemplate(PY, SCRIPT);
-}
+// 测试始终使用独立内存模板；绝不读取或依赖开发者电脑上的真实 MiMo 配置。
+const template = buildUsageTemplate(PY, SCRIPT);
+console.log("  使用独立内存模板（不读取用户配置）");
 check("模板含且仅含 1 个 shell 命令", [...template.matchAll(SHELL_REGEX)].length === 1);
 check("shell 命令中不含裸 $1/$2 拼接", !/\$\d+/.test(template.split("!`")[1]?.split("`")[0] || ""));
-check("参数经 --arg-string 透传（防注入）", template.includes("--arg-string"));
+check("模板不透传用户参数到 shell", !template.includes("$ARGUMENTS") && !template.includes("--arg-string"));
 check("指令要求只复述输出", /原样/.test(template) && /不要臆造/.test(template));
 
 console.log("\n=== 正常调用（默认 all） ===");
@@ -93,54 +88,44 @@ if (!CAN_SPAWN) {
 } else {
   const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-e2e-"));
   const outFile = path.join(outDir, "usage.html");
-  // 直接执行脚本（等价于模板里的 shell 命令）
-  const stdout = runPy([SCRIPT, "--out", outFile]);
-  check("脚本产出 stdout", stdout.length > 0);
-  check("stdout 为简短一行", stdout.trim().split("\n").length === 1, `(${stdout.trim().length} 字符)`);
-  check("HTML 已生成", fs.existsSync(outFile));
-  const html = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : "";
-  check("HTML 自包含（无 fetch）", !/(^|[^a-zA-Z])fetch\(/.test(html));
-  check("HTML 内联数据", html.includes("var DATA"));
-  check("HTML 含重新生成按钮", html.includes('id="regen"'));
-  // 三块内容：data 里必有 kind，且 buildBody 会按 kind 渲染对应卡片。
-  // 断言「渲染函数齐备」而非「字面文案」，避免文案微调导致假失败。
-  check("HTML 三块渲染器齐备",
-    html.includes("function tokenCard") && html.includes("function sessionCard") && html.includes("function contextCard"));
-  check("HTML 含热力图渲染器", html.includes("function heatmapCard"));
-  check("HTML 含模型调用块渲染器", html.includes("function modelCard"));
-  check("HTML 含三块容器挂载点", html.includes('id="root"'));
-  fs.rmSync(outDir, { recursive: true, force: true });
+  const dbFile = path.join(outDir, "mimocode.db");
+  // 用与 Python 单元测试相同的 schema 创建临时数据库，不依赖测试机安装 MiMo。
+  const testDir = path.dirname(fileURLToPath(import.meta.url)).split(path.sep).join("/");
+  const fixtureCode = [
+    "import sys, time",
+    `sys.path.insert(0, ${JSON.stringify(testDir)})`,
+    "from test_python import make_db",
+    "make_db(sys.argv[1], int(time.time() * 1000))",
+  ].join(String.fromCharCode(10));
+  runPy(["-c", fixtureCode, dbFile]);
+  if (!CAN_SPAWN) {
+    fs.rmSync(outDir, { recursive: true, force: true });
+  } else {
+    check("临时测试数据库已创建", fs.existsSync(dbFile));
+    // 直接执行脚本并显式指定 fixture DB，不读取用户数据库。
+    const stdout = runPy([SCRIPT, "--db", dbFile, "--out", outFile]);
+    check("脚本产出 stdout", stdout.length > 0);
+    check("stdout 为简短一行", stdout.trim().split(String.fromCharCode(10)).length === 1, `(${stdout.trim().length} 字符)`);
+    check("HTML 已生成", fs.existsSync(outFile));
+    const html = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : "";
+    // 静态路径：LIVE 必须是 null（无实时服务）；允许运行时含刷新函数定义，但不得启用。
+    check("静态 HTML 的 LIVE=null（未附着实时服务）", html.includes("var LIVE = null"));
+    check("HTML 内联数据", html.includes("var DATA"));
+    check("HTML 含刷新按钮", html.includes('id="regen"'));
+    check("HTML 运行时默认折叠分类树", html.includes('(open ? "true" : "false")'));
+    // 三块内容：data 里必有 kind，且 buildBody 会按 kind 渲染对应卡片。
+    check("HTML 三块渲染器齐备",
+      html.includes("function tokenCard") && html.includes("function sessionCard") && html.includes("function contextCard"));
+    check("HTML 含热力图渲染器", html.includes("function heatmapCard"));
+    check("HTML 含模型调用块渲染器", html.includes("function modelCard"));
+    check("HTML 含三块容器挂载点", html.includes('id="root"'));
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
 }
 
-console.log("\n=== 参数透传（token --days 7） ===");
-if (!CAN_SPAWN) {
-  console.log("  SKIP  执行类断言已跳过（见 python test/test_python.py）");
-} else {
-  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-e2e-"));
-  const outFile = path.join(outDir, "t.html");
-  runPy([SCRIPT, "--arg-string", `token --days 7 --out "${outFile}"`]);
-  check("arg-string 被正确拆分执行", fs.existsSync(outFile));
-  const html = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : "";
-  // 面板是客户端渲染的，静态 HTML 里只嵌 `var DATA = {...}`。
-  // 因此断言 DATA 字段，而不是断言渲染后的字面文案。
-  check("kind=token 生效", /"kind"\s*:\s*"token"/.test(html));
-  check("days=7 生效", /"days"\s*:\s*7\b/.test(html));
-  fs.rmSync(outDir, { recursive: true, force: true });
-}
-
-console.log("\n=== 注入防护 ===");
-if (!CAN_SPAWN) {
-  console.log("  SKIP  执行类断言已跳过（见 python test/test_python.py 的白名单用例）");
-} else {
-  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "cmd-e2e-"));
-  const canary = path.join(outDir, "PWNED.txt");
-  const outFile = path.join(outDir, "safe.html");
-  const evil = `token ; echo pwned > "${canary}" && --out "${outFile}"`;
-  const stdout = runPy([SCRIPT, "--arg-string", evil]);
-  check("恶意参数未被执行", !fs.existsSync(canary));
-  check("仍正常生成（白名单剔除非法 token）", stdout.includes("已生成"));
-  fs.rmSync(outDir, { recursive: true, force: true });
-}
+console.log("\n=== 注入面检查 ===");
+check("模板中没有用户输入占位符", !template.includes("$ARGUMENTS"));
+check("模板命令中没有动态参数透传", !template.includes("--arg-string"));
 
 console.log(`\n${failures === 0 ? "COMMAND E2E OK" : "COMMAND E2E FAILED: " + failures}`);
 process.exit(failures === 0 ? 0 : 1);
