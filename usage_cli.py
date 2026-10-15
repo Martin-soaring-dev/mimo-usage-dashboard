@@ -827,9 +827,11 @@ h3{font-size:12px;margin:0 0 10px;font-weight:650;color:var(--muted);letter-spac
 .hm .legend{margin:10px 0 0;justify-content:flex-end;gap:4px}
 .hm .legend i{width:11px;height:11px;border-radius:3px;display:inline-block}
 /* 悬浮提示层：position:fixed 自绘，读格子的 data-tip，贴近视口边缘时自动翻转/夹紧 */
-.hm-tip{position:fixed;z-index:99;padding:7px 10px;border-radius:8px;max-width:320px;
+.hm-tip{position:fixed;z-index:99;padding:7px 10px;border-radius:8px;
+  box-sizing:border-box;max-width:min(320px,calc(100vw - 12px));max-height:calc(100vh - 12px);
+  overflow-x:hidden;overflow-y:auto;overflow-wrap:anywhere;white-space:normal;
   background:rgba(31,35,41,.94);color:#fff;font-size:11.5px;line-height:1.5;
-  pointer-events:none;white-space:nowrap;box-shadow:0 4px 14px rgba(16,24,40,.22)}
+  pointer-events:none;box-shadow:0 4px 14px rgba(16,24,40,.22)}
 .hm-tip[hidden]{display:none}
 .ctx-ring{display:flex;align-items:center;gap:18px}
 .ring{width:110px;height:110px;flex:none}
@@ -1214,7 +1216,10 @@ function placeTip(el, cell){
     if (x + bw > vw - 6) x = vw - bw - 6;
     if (x < 6) x = 6;
     var y = r.top - bh - 8;
-    if (y < 6) y = Math.min(r.bottom + 8, vh - bh - 6);
+    if (y < 6) y = r.bottom + 8;
+    // Prefer a fully visible tooltip; allow a clipped viewport only when
+    // the viewport itself is smaller than the reserved 12px safety margin.
+    y = Math.max(6, Math.min(y, Math.max(6, vh - bh - 6)));
     el.style.left = x.toFixed(1) + "px";
     el.style.top = y.toFixed(1) + "px";
   } catch (e) { /* 拿不到布局时静默跳过：提示层本身照常显示 */ }
