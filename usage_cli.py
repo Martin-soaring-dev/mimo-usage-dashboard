@@ -124,17 +124,101 @@ def default_data_dir() -> str:
     return os.path.join(base, "mimo-usage-dashboard")
 
 
-def model_context_limit(model_id: str | None) -> int | None:
-    if not model_id:
+def _read_jsonc_config(path: str) -> dict:
+    """Read JSONC without modifying the configuration file."""
+    with open(path, encoding="utf-8-sig") as stream:
+        source = stream.read()
+    result = []
+    i = 0
+    quoted = False
+    while i < len(source):
+        ch = source[i]
+        if quoted:
+            result.append(ch)
+            if ch == "\\" and i + 1 < len(source):
+                result.append(source[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                quoted = False
+            i += 1
+            continue
+        if ch == '"':
+            quoted = True
+            result.append(ch)
+            i += 1
+            continue
+        if source.startswith("//", i):
+            while i < len(source) and source[i] not in "\r\n":
+                i += 1
+            continue
+        if source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            if end < 0:
+                raise ValueError("unterminated JSONC block comment")
+            i = end + 2
+            continue
+        result.append(ch)
+        i += 1
+    clean = re.sub(r",(\s*[}\]])", r"\1", "".join(result))
+    obj = json.loads(clean)
+    if not isinstance(obj, dict):
+        raise ValueError("JSONC config root must be an object")
+    return obj
+
+
+def _context_limit_value(config: dict, provider_id: str, model_id: str) -> int | None:
+    providers = config.get("provider")
+    if not isinstance(providers, dict):
         return None
-    mid = str(model_id).lower()
-    if mid in MODEL_CONTEXT_LIMITS:
-        return MODEL_CONTEXT_LIMITS[mid]
-    best, best_len = None, 0
-    for key, val in MODEL_CONTEXT_LIMITS.items():
-        if mid.startswith(key) and len(key) > best_len:
-            best, best_len = val, len(key)
-    return best
+    provider = providers.get(provider_id)
+    if not isinstance(provider, dict):
+        return None
+    models = provider.get("models")
+    if not isinstance(models, dict):
+        return None
+    model = models.get(model_id)
+    if not isinstance(model, dict):
+        return None
+    limits = model.get("limit")
+    if not isinstance(limits, dict):
+        return None
+    value = limits.get("context")
+    return value if type(value) is int and value > 0 else None
+
+
+def model_context_limit(model_id: str | None, provider_id: str | None = None,
+                        directory: str | None = None) -> tuple[int | None, str]:
+    """Return (context limit, provenance), never guess across providers.
+
+    A broken configuration is *not* silently replaced with a hard-coded value.
+    """
+    if not model_id or not provider_id:
+        return None, "unknown"
+    home = os.path.join(os.path.expanduser("~"), ".config", "mimocode", "mimocode.jsonc")
+    paths = [home]
+    if directory:
+        paths.append(os.path.join(directory, "mimocode.jsonc"))
+        paths.append(os.path.join(directory, ".mimocode", "mimocode.jsonc"))
+    resolved = None
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        try:
+            config = _read_jsonc_config(path)
+        except (OSError, ValueError, UnicodeError):
+            return None, "config-error"
+        val = _context_limit_value(config, str(provider_id), str(model_id))
+        if val is not None:
+            resolved = val
+    if resolved is not None:
+        return resolved, "config"
+    # First-party MiMo models keep their built-in window when no config declares one.
+    if provider_id == "xiaomi-token-plan-cn":
+        known = MODEL_CONTEXT_LIMITS.get(str(model_id).lower())
+        if known and str(model_id).lower().startswith("mimo-"):
+            return known, "builtin"
+    return None, "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -493,19 +577,24 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
         messages = 0
         last_msg_tokens = None
         provider_id = model_id = None
+        message_models = {}
+        latest_token_model = None
+        step_model = None
         last_activity = int(srow[3] or 0)
 
         for r in conn.execute(
-            "SELECT time_created, data FROM message WHERE session_id=? ORDER BY time_created ASC",
+            "SELECT id, time_created, data FROM message WHERE session_id=? ORDER BY time_created ASC",
             (sid,),
         ):
-            d = _loads(r[1])
+            d = _loads(r[2])
             if not isinstance(d, dict) or d.get("role") != "assistant":
                 continue
             messages += 1
-            last_activity = max(last_activity, int(r[0] or 0))
-            if d.get("providerID") and not provider_id:
-                provider_id, model_id = d.get("providerID"), d.get("modelID")
+            last_activity = max(last_activity, int(r[1] or 0))
+            pair = (d.get("providerID"), d.get("modelID"))
+            if all(isinstance(x, str) and x for x in pair):
+                message_models[r[0]] = pair
+                provider_id, model_id = pair
             t = d.get("tokens")
             if t:
                 inp = int(t.get("input") or 0); out = int(t.get("output") or 0)
@@ -517,6 +606,7 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
                 agg["reasoning"] += rea; agg["read"] += rd; agg["write"] += wr
                 if isinstance(t.get("total"), (int, float)):
                     last_msg_tokens = t
+                    latest_token_model = message_models.get(r[0])
 
         tools = 0
         steps = 0
@@ -524,7 +614,7 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
         part_types: list = []
         tool_names: list = []
         for r in conn.execute(
-            "SELECT time_created, data FROM part WHERE session_id=? ORDER BY time_created ASC",
+            "SELECT time_created, data, message_id FROM part WHERE session_id=? ORDER BY time_created ASC",
             (sid,),
         ):
             d = _loads(r[1])
@@ -540,11 +630,18 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
                 t = d.get("tokens")
                 if isinstance(t, dict) and isinstance(t.get("total"), (int, float)):
                     last_step_tokens = t
+                    step_model = message_models.get(r[2])
             last_activity = max(last_activity, int(r[0] or 0))
 
         ctx = last_step_tokens or last_msg_tokens
         used = int(ctx["total"]) if (ctx and isinstance(ctx.get("total"), (int, float))) else 0
-        resolved_limit = limit if (limit and limit > 0) else model_context_limit(model_id)
+        active_model = (step_model if last_step_tokens else latest_token_model)
+        if active_model:
+            provider_id, model_id = active_model
+        if limit is not None and limit > 0:
+            resolved_limit, limit_source = limit, "explicit"
+        else:
+            resolved_limit, limit_source = model_context_limit(model_id, provider_id, srow[2])
 
         detail = None
         if ctx:
@@ -601,6 +698,7 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
             "context": {
                 "used": used,
                 "limit": resolved_limit,
+                "limitSource": limit_source,
                 "ratio": (used / resolved_limit) if resolved_limit else None,
                 "source": src,
                 "detail": detail,
@@ -2507,7 +2605,7 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=None,
                         help="输出 HTML 路径（默认用户数据目录 mimo-usage-<kind>-<日期>.html）")
     parser.add_argument("--session", default=None, help="上下文视图指定的会话 ID（默认最近活跃）")
-    parser.add_argument("--limit", type=int, default=None, help="上下文上限 tokens（覆盖内置模型表）")
+    parser.add_argument("--limit", type=int, default=None, help="上下文上限 tokens（覆盖模型配置；不提供时自动解析）")
     parser.add_argument("--open", action="store_true", help="启动/复用本地实时服务并用浏览器打开")
     parser.add_argument("--print-path", action="store_true", help="只在标准输出打印生成的文件路径")
     parser.add_argument("--shutdown", action="store_true", help="请求关闭本机实时服务后退出")

@@ -48,7 +48,7 @@
     "usage:context": "python usage_cli.py context",
     "register": "python register_command.py",
     "unregister": "python register_command.py --uninstall",
-    "test": "python test/test_python.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs",
+    "test": "python test/test_python.py && python test/test_issue5.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs",
     "test:node": "node test/command-e2e.mjs",
     "test:runtime": "node test/runtime-check.mjs",
     "test:ui-dom": "node test/ui-dom.mjs",
@@ -57,7 +57,7 @@
     "test:install": "powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1",
     "test:install-upgrade": "powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1",
     "test:live": "python test/e2e_live.py",
-    "test:all": "python test/test_python.py && python test/test_installer.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs && node test/ui-geometry.mjs && node test/refresh-e2e.mjs && node test/cli.test.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1 && python test/e2e_live.py",
+    "test:all": "python test/test_python.py && python test/test_issue5.py && python test/test_installer.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs && node test/ui-geometry.mjs && node test/refresh-e2e.mjs && node test/cli.test.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1 && python test/e2e_live.py",
     "test:installer": "python test/test_installer.py",
     "test:npm": "node test/cli.test.mjs"
   },
