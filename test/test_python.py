@@ -27,6 +27,7 @@ sys.path.insert(0, ROOT)
 
 import usage_cli as U  # noqa: E402
 import register_command as R  # noqa: E402
+import installer as I  # noqa: E402
 
 FAILS = 0
 
@@ -36,6 +37,28 @@ def check(name: str, ok: bool, extra: str = "") -> None:
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  {extra}" if extra else ""))
     if not ok:
         FAILS += 1
+
+
+def cleanup_temp(path: str, label: str, attempts: int = 3) -> None:
+    """删除临时目录；删不掉就**有界重试**，最终仍失败则把残留如实打印出来。
+
+    刻意不用 `shutil.rmtree(..., ignore_errors=True)`：Windows 上它删不掉被占用的
+    文件却把错误咽掉，"删掉了"和"没删掉"返回值一样 —— 几十 MB 的大库 fixture 会
+    在 %TEMP% 里无声累积。这里用 installer.force_rmtree（清只读位重试、返回真实
+    存在性）拿真实结果。
+
+    重试是**有界**的：失败通常只是句柄还没释放（例如后台请求线程刚跑完一次大库
+    聚合），等一小会儿就能删；真的删不掉就打印残留 —— 只报告，既不把原本失败的
+    测试改绿，也不给通过的测试引入新的抖动。
+    """
+    if not os.path.isdir(path):
+        return
+    for attempt in range(attempts):
+        if I.force_rmtree(path):
+            return
+        if attempt + 1 < attempts:
+            time_module.sleep(0.5)
+    print(f"  WARN  {label}未能清理，残留：{path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1545,7 +1568,6 @@ print(json.dumps(live, ensure_ascii=False))
     print("\n=== 大库下的实时服务启动（回归） ===")
     import http.server as _hs
     import socket as _bsock
-    import installer as _installer
 
     big_dir = os.path.join(tmpdir, "big-live")
     os.makedirs(big_dir, exist_ok=True)
@@ -1554,8 +1576,8 @@ print(json.dumps(live, ensure_ascii=False))
     big_mb = os.path.getsize(big_db) / (1 << 20)
     check("大库 fixture 超过 20MB（覆盖原故障规模）", big_mb > 20, f"({big_mb:.1f}MB)")
     check("身份标识与安装器一致（协议常量不漂移）",
-          U.LIVE_APP_ID == _installer.LIVE_APP_ID,
-          f"(usage_cli={U.LIVE_APP_ID}, installer={_installer.LIVE_APP_ID})")
+          U.LIVE_APP_ID == I.LIVE_APP_ID,
+          f"(usage_cli={U.LIVE_APP_ID}, installer={I.LIVE_APP_ID})")
 
     # 替身：数 card_data 被调用几次。用"探测有没有做聚合"来证明它是常量时间，
     # 而不是断言毫秒级耗时（耗时随机器漂移，也会掩盖真正的机制）。
@@ -1569,12 +1591,17 @@ print(json.dumps(live, ensure_ascii=False))
     U.card_data = _counting_card_data
 
     old_data_big = os.environ.get("MIMO_USAGE_DATA_DIR")
+    old_db_big = os.environ.get("MIMO_USAGE_DB")
     big_data = os.path.join(tmpdir, "big-live-data")
     os.makedirs(big_data, exist_ok=True)
     big_spawn_data = os.path.join(tmpdir, "big-live-spawn")
     os.makedirs(big_spawn_data, exist_ok=True)
     os.environ["MIMO_USAGE_DATA_DIR"] = big_data
+    # 本段所有调用都显式传库路径，但仍把默认库环境变量钉在合成库上：将来若有人
+    # 在这里加了不带路径的调用（例如 U.main([])），它才不会落到真实用户库。
+    os.environ["MIMO_USAGE_DB"] = big_db
     bhttpd = None
+    bt = None
     e2e_live = None
     try:
         # ---- A. 端点契约：ping 给出固定身份，且不回显 token / 不含库路径 ----
@@ -1628,7 +1655,7 @@ print(json.dumps(live, ensure_ascii=False))
 
         # 安装器自带一份探针，同样不能聚合
         _agg["n"] = 0
-        ist = _installer.service_status()
+        ist = I.service_status()
         check("安装器探测：大库实例判为 owned",
               ist["stateValid"] and ist["reachable"] and ist["owned"], f"({ist})")
         check("安装器探测不触发全量聚合", _agg["n"] == 0, f"(calls={_agg['n']})")
@@ -1769,16 +1796,23 @@ print(json.dumps(live, ensure_ascii=False))
             U.spawn_serve_child = orig_spawn
     finally:
         U.card_data = _real_card_data
+        # 关掉本段的同进程服务，并**有界**等待其线程收尾：请求线程若还在跑 24MB
+        # 库的聚合，DB 句柄不释放，紧接着删目录就会失败。
         if bhttpd is not None:
             try:
                 bhttpd.shutdown()
                 bhttpd.server_close()
             except Exception:
                 pass
-        # 收掉本节点起来的子进程（只用本项目协议；失败才兜底 kill 自己 spawn 的 pid）
+        if bt is not None:
+            bt.join(timeout=5)
+        # 收掉本节点起来的子进程：只认**自己**拿到的 token 与 pid —— 不用状态文件
+        # 里的未知 pid 动手，也不会去关闭别人的监听者。
         os.environ["MIMO_USAGE_DATA_DIR"] = big_spawn_data
+        own = e2e_live if isinstance(e2e_live, dict) else {}
+        own_token, own_pid = own.get("token"), own.get("pid")
         st_big = U.read_server_state()
-        if st_big and st_big.get("token"):
+        if own_token and st_big and st_big.get("token") == own_token:
             try:
                 req_sd_big = _ureq.Request(
                     f"http://{U.LOOPBACK_HOST}:{int(st_big['port'])}/"
@@ -1787,13 +1821,14 @@ print(json.dumps(live, ensure_ascii=False))
                     check("大库：服务接受 shutdown", resp.status == 200)
             except Exception as ex:
                 check("大库：服务接受 shutdown", False, f"({ex})")
+        if own_pid:
             for _ in range(25):
-                if not U._pid_alive(int(st_big.get("pid") or 0)):
+                if not U._pid_alive(int(own_pid)):
                     break
                 time_module.sleep(0.2)
-            if U._pid_alive(int(st_big.get("pid") or 0)):
+            if U._pid_alive(int(own_pid)):
                 try:
-                    os.kill(int(st_big["pid"]), 9)
+                    os.kill(int(own_pid), 9)
                 except Exception:
                     pass
         U.clear_server_state()
@@ -1801,6 +1836,14 @@ print(json.dumps(live, ensure_ascii=False))
             os.environ.pop("MIMO_USAGE_DATA_DIR", None)
         else:
             os.environ["MIMO_USAGE_DATA_DIR"] = old_data_big
+        if old_db_big is None:
+            os.environ.pop("MIMO_USAGE_DB", None)
+        else:
+            os.environ["MIMO_USAGE_DB"] = old_db_big
+        # 尽早释放 20MB+ 的 fixture 与数据目录；删不掉就打印残留（不静默吞掉）
+        cleanup_temp(big_dir, "大库 fixture 目录")
+        cleanup_temp(big_data, "大库数据目录")
+        cleanup_temp(big_spawn_data, "大库 spawn 数据目录")
 
     # ---- P0 回归：selfcheck 必须零副作用（不读库、不写文件、无库也能通过）----
     #  安装器用它验证"这份 usage_cli.py 能被目标解释器启动"，所以它绝不能有任何
@@ -1845,12 +1888,12 @@ print(json.dumps(live, ensure_ascii=False))
             os.environ["MIMO_USAGE_DB"] = _old_db_sc
 
     # ---- 收尾 ----
-    try:
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        shutil.rmtree(reg_root, ignore_errors=True)
-    except OSError:
-        pass
+    # 大库 fixture 有 20MB+，后台线程还可能持有过 DB 句柄：用 cleanup_temp
+    # （installer.force_rmtree：清只读位重试 + 返回真实存在性）替代
+    # shutil.rmtree(..., ignore_errors=True) —— 后者删不掉时会把失败咽掉，
+    # 留下几十 MB 残留却照样打印成功。清理失败只报告残留，不覆盖已有结论。
+    cleanup_temp(tmpdir, "测试临时目录")
+    cleanup_temp(reg_root, "注册测试目录")
 
     print(f"\n{'PYTHON TESTS OK' if FAILS == 0 else 'PYTHON TESTS FAILED: ' + str(FAILS)}")
     return 0 if FAILS == 0 else 1
