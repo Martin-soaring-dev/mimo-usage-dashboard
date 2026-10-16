@@ -1548,7 +1548,16 @@ function buildBody(data){
       '" aria-controls="tab-content" aria-selected="' + (i === 0 ? "true" : "false") +
       '" data-tab="' + tab.id + '">' + tab.label + '</button>';
   }).join("") + '</div>';
-  return nav + '<div id="tab-content" role="tabpanel" aria-labelledby="tab-token">' +
+  // Issue #16 切片 2：用量范围两档开关。「会话用量」= 看被定格的会话；
+  // 「全局用量」= 看全库聚合（与会话无关）。控件只负责切标签 + 把选择写进 URL 的
+  // mode 参数（读写都在页内 glue 里完成），因此状态可见、且刷新后保持。
+  var scope = '<div class="seg" role="group" aria-label="用量范围" ' +
+    'style="margin-top:10px;display:inline-flex">' +
+    '<button type="button" data-scope="session" aria-pressed="false">会话用量</button>' +
+    '<button type="button" data-scope="global" aria-pressed="false">全局用量</button>' +
+    '</div>' +
+    '<button class="btn" type="button" id="reset-pin" style="margin-left:8px">重置定格</button>';
+  return nav + scope + '<div id="tab-content" role="tabpanel" aria-labelledby="tab-token">' +
     renderTab("token", data) + '</div>';
 }
 
@@ -1771,6 +1780,67 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "", live: dict | N
     if (OUT) msg += "\\n\\n快照文件：\\n" + OUT;
     alert(msg);
   }});
+
+  // ---- Issue #16 切片 2：用量范围两档（会话用量 / 全局用量）----
+  // 必须放在 root 的 click 监听注册**之后**：切换标签直接复用既有的事件委托。
+  (function(){{
+    try {{
+      var btns = root.querySelectorAll("[data-scope]");
+      var rst = document.getElementById("reset-pin");
+      if (!btns.length) return;
+      var pageUrl = (typeof LIVE !== "undefined" && LIVE) ? (LIVE.pageUrl || "") : "";
+      var hasTab = false;
+      var curMode = "session";
+      try {{
+        if (pageUrl) {{
+          var u0 = new URL(pageUrl);
+          hasTab = !!u0.searchParams.get("tab");
+          if (hasTab) curMode = (u0.searchParams.get("mode") === "global") ? "global" : "session";
+        }}
+      }} catch (e0) {{ /* 没有 URL API：退化为静态行为 */ }}
+      // 没有定格就没什么可重置：隐藏按钮而不是给一个点了没反应的入口。
+      if (rst && !hasTab) rst.hidden = true;
+      var paint = function(mode){{
+        btns.forEach(function(b){{
+          b.setAttribute("aria-pressed", b.getAttribute("data-scope") === mode ? "true" : "false");
+        }});
+      }};
+      var goTab = function(id){{
+        var t = root.querySelector('[data-tab="' + id + '"]');
+        if (t) t.click();
+      }};
+      btns.forEach(function(b){{
+        b.addEventListener("click", function(){{
+          var m = b.getAttribute("data-scope");
+          paint(m);
+          goTab(m === "global" ? "token" : "context");
+          try {{
+            if (pageUrl && typeof location !== "undefined" && location.href) {{
+              // 以**当前地址栏**为基准改，而不是用服务端最初给的 pageUrl ——
+              // 否则会把已经写进地址栏的定格会话（?session=<id>）打回 latest。
+              var u = new URL(location.href);
+              u.searchParams.set("mode", m);
+              history.replaceState(null, "", u.pathname + u.search);
+            }}
+          }} catch (e1) {{ /* 位置栏不变，页面仍按选择切换 */ }}
+        }});
+      }});
+      if (rst) {{
+        rst.addEventListener("click", function(){{
+          try {{
+            var u2 = new URL((typeof location !== "undefined" && location.href) ? location.href : pageUrl);
+            u2.searchParams.delete("tab");
+            u2.searchParams.delete("mode");
+            // 关键：地址栏里可能已经被写入了显式的 session=<定格到的 id>（见上面的
+            // replaceState）。只删 tab 不足以解除定格 —— 必须把它放回 latest。
+            u2.searchParams.set("session", "latest");
+            location.assign(u2.pathname + u2.search);
+          }} catch (e2) {{ /* ignore */ }}
+        }});
+      }}
+      if (hasTab) {{ paint(curMode); goTab(curMode === "global" ? "token" : "context"); }}
+    }} catch (e) {{ /* 控件不可用时静默跳过，页面照常显示 */ }}
+  }})();
 }})();
 </script>
 </body></html>
@@ -2056,6 +2126,8 @@ class _UsageHandler(BaseHTTPRequestHandler):
                         spec["limit"] = options["limit"]
                     if options.get("tab"):
                         spec["tab"] = options["tab"]
+                    if options.get("mode"):
+                        spec["mode"] = options["mode"]
                     suffix = "?" + urlencode(spec)
                 live = {
                     "reportUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/api/report" + suffix,
@@ -2116,7 +2188,7 @@ class _UsageHandler(BaseHTTPRequestHandler):
         """Each dashboard URL owns its query; no mutable process-wide session selection."""
         raw = self.path.partition("?")[2]
         params = parse_qs(raw, keep_blank_values=True, max_num_fields=8)
-        if any(k not in ("session", "days", "limit", "kind", "tab") or len(v) != 1
+        if any(k not in ("session", "days", "limit", "kind", "tab", "mode") or len(v) != 1
                for k, v in params.items()):
             raise ValueError("无效或重复的看板查询参数")
         session = params.get("session", ["latest"])[0]
@@ -2126,6 +2198,10 @@ class _UsageHandler(BaseHTTPRequestHandler):
         tab = params.get("tab", [""])[0]
         if tab and (len(tab) > 64 or any(c not in _BINDING_CHARS for c in tab)):
             raise ValueError("无效的看板令牌")
+        # mode：用量范围两档。「session」= 用已定格的会话；「global」= 全库聚合，绕过定格。
+        mode = params.get("mode", [""])[0]
+        if mode not in ("", "session", "global"):
+            raise ValueError("无效的用量范围")
         kind = params.get("kind", ["all"])[0]
         if kind not in KINDS:
             raise ValueError("无效视图")
@@ -2139,14 +2215,15 @@ class _UsageHandler(BaseHTTPRequestHandler):
             raise ValueError("统计参数超出范围")
         return dict(kind=kind, days=days,
                     session_id=None if session == "latest" else session, limit=limit,
-                    tab=tab or None)
+                    tab=tab or None, mode=mode or None)
 
     def _load(self) -> dict:
         options = self._request_options()
         tab = options.pop("tab", None)
-        # 带 tab 且未显式指定会话时：用该 tab 定格的会话（首次请求即定格）。
-        # 显式 session=<id> 优先 —— URL 里写了 id 就以 URL 为准。
-        if tab and options["session_id"] is None:
+        mode = options.pop("mode", None)
+        # mode=global 是「全库聚合」档：与会话无关，**故意不查定格**，
+        # 这样即使别的会话随后活动，全局视图也不受定格影响。
+        if tab and mode != "global" and options["session_id"] is None:
             frozen = frozen_session(self.server.db, tab)  # type: ignore[attr-defined]
             if frozen:
                 options["session_id"] = frozen
@@ -2472,6 +2549,27 @@ def write_binding(tab: str, session_id: str) -> None:
         os.replace(tmp, path)
     except OSError:
         pass
+    prune_bindings()
+
+
+def prune_bindings(max_age_days: int = 30) -> None:
+    """回收过期绑定，避免每个 tab 一个文件无限累积（生命周期）。
+
+    只在写入路径上顺带做一次，目录很小、代价可忽略；失败静默（不影响定格本身）。
+    """
+    cutoff = time.time() - max(1, int(max_age_days)) * 86400
+    try:
+        for name in os.listdir(session_bindings_dir()):
+            if not name.endswith(".json"):
+                continue
+            full = os.path.join(session_bindings_dir(), name)
+            try:
+                if os.path.getmtime(full) < cutoff:
+                    os.unlink(full)
+            except OSError:
+                continue
+    except OSError:
+        return
 
 
 def frozen_session(db_path: str, tab: str) -> str | None:
@@ -2898,6 +2996,8 @@ def main(argv=None) -> int:
         # 每次 /usage-open 一个独立令牌（Issue #16）：URL 互不相同，可在不同标签页并存；
         # 该页首次打开时服务端把「此刻最近活跃的会话」定格下来，之后刷新不再漂移。
         query["tab"] = secrets.token_urlsafe(9)
+        # 默认落在「会话用量」档（上下文使用量视图，用上面那个定格会话）。
+        query["mode"] = "session"
         opened_url = live["pageUrl"] + "?" + urlencode(query)
         try:
             webbrowser.open(opened_url)
