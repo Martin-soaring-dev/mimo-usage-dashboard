@@ -1382,6 +1382,33 @@ def main() -> int:
             finally:
                 raw2.close()
 
+            # Issue #18：原始 query 不得未转义回显进页内 <script>。
+            # 首页会把 LIVE 用 json.dumps 嵌进 <script>，而 json.dumps 不转义 < > /，
+            # 所以回显里一旦出现原始 "</script>"，浏览器就会提前闭合脚本元素。
+            # 这里必须用裸 socket 发送原始字符 —— urllib 会先做百分号编码，构造不出该请求。
+            raw3 = _sock.create_connection(("127.0.0.1", urls["port"]), 2)
+            try:
+                path = f"/{urls['token']}/?session=</script><b>x</b>"
+                raw3.sendall(
+                    f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{urls['port']}\r\n"
+                    f"Connection: close\r\n\r\n".encode("ascii")
+                )
+                resp_raw = b""
+                while True:
+                    chunk = raw3.recv(4096)
+                    if not chunk:
+                        break
+                    resp_raw += chunk
+                page_raw = resp_raw.decode("utf-8", "replace")
+                live_seg = (page_raw.split("var LIVE =", 1)[1].split("};", 1)[0]
+                            if "var LIVE =" in page_raw else "")
+                check("Issue #18：回显的 LIVE 片段不含未转义的 '<'",
+                      bool(live_seg) and "<" not in live_seg, f"(segment={live_seg[:110]!r})")
+                check("Issue #18：回显的 query 被重新编码（出现 %3C）",
+                      "%3C" in live_seg or "%3c" in live_seg, f"(segment={live_seg[:110]!r})")
+            finally:
+                raw3.close()
+
             # shutdown 不接受跨源 Origin=null
             req_sd_bad = _ureq.Request(
                 urls["reportUrl"].rsplit("/api/", 1)[0] + "/api/shutdown",

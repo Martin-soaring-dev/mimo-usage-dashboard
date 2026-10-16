@@ -2021,8 +2021,20 @@ class _UsageHandler(BaseHTTPRequestHandler):
         try:
             if not rest or rest == ["index.html"]:
                 data = self._load()
-                query = self.path.partition("?")[2]
-                suffix = ("?" + query) if query else ""
+                # 只回显「已校验参数重新编码」后的 query，不回显原始 query：
+                # 这段文本会被 json.dumps 嵌进页内 <script> 的 var LIVE，
+                # 而 json.dumps 不转义 < > /，原始 "</script>" 会提前闭合脚本元素。
+                suffix = ""
+                if self.path.partition("?")[2]:
+                    options = self._request_options()
+                    spec = {
+                        "session": options["session_id"] if options["session_id"] is not None else "latest",
+                        "days": options["days"],
+                        "kind": options["kind"],
+                    }
+                    if options["limit"] is not None:
+                        spec["limit"] = options["limit"]
+                    suffix = "?" + urlencode(spec)
                 live = {
                     "reportUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/api/report" + suffix,
                     "pageUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/" + suffix,
