@@ -1815,8 +1815,10 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "", live: dict | N
           paint(m);
           goTab(m === "global" ? "token" : "context");
           try {{
-            if (pageUrl) {{
-              var u = new URL(pageUrl);
+            if (pageUrl && typeof location !== "undefined" && location.href) {{
+              // 以**当前地址栏**为基准改，而不是用服务端最初给的 pageUrl ——
+              // 否则会把已经写进地址栏的定格会话（?session=<id>）打回 latest。
+              var u = new URL(location.href);
               u.searchParams.set("mode", m);
               history.replaceState(null, "", u.pathname + u.search);
             }}
@@ -1826,10 +1828,13 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "", live: dict | N
       if (rst) {{
         rst.addEventListener("click", function(){{
           try {{
-            var u = new URL(pageUrl);
-            u.searchParams.delete("tab");
-            u.searchParams.delete("mode");
-            location.assign(u.pathname + u.search);
+            var u2 = new URL((typeof location !== "undefined" && location.href) ? location.href : pageUrl);
+            u2.searchParams.delete("tab");
+            u2.searchParams.delete("mode");
+            // 关键：地址栏里可能已经被写入了显式的 session=<定格到的 id>（见上面的
+            // replaceState）。只删 tab 不足以解除定格 —— 必须把它放回 latest。
+            u2.searchParams.set("session", "latest");
+            location.assign(u2.pathname + u2.search);
           }} catch (e2) {{ /* ignore */ }}
         }});
       }}
