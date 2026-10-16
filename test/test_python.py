@@ -594,6 +594,18 @@ def main() -> int:
           not any(k in inspect.getsource(U) for k in
                   ("INSERT INTO", "UPDATE ", "DELETE FROM", "CREATE TABLE", "ATTACH", "PRAGMA")))
 
+    # ---- Issue #19 A：实时服务不得再挂「写了但无人读」的死状态 ----
+    # 早前的 create_usage_server 在实例上挂了 days / session_id / limit；会话口径改成
+    # 请求级参数（每次请求 query）之后，这三个**没有任何读取方**，却仍留在实例上，
+    # 会让后来者误以为设置它们能生效。这里精确钉住这三项。
+    # 注：通用的「属性是否真有人读」无法用源码文本可靠表达 —— lock / idle_seconds 是
+    # 闭包读取，而 days / session_id 同时是参数名，做成通配检查必然误报或漏报。
+    _src = inspect.getsource(U)
+    _dead = [n for n in ("days", "session_id", "limit") if f"httpd.{n} =" in _src]
+    check("Issue #19：server 不再挂 days / session_id / limit 死状态", not _dead, f"(仍在={_dead})")
+    check("Issue #19：ping 依赖的 kind 仍有「赋值 + 读取」两条腿",
+          "httpd.kind =" in _src and "self.server.kind" in _src)
+
     # ---- 3e. 只读快照回退的临时副本生命周期（Release Gate 回归） ----
     # 旧实现：_open_readonly 失败回退时 mkdtemp 整库拷贝到 %TEMP%，**从不删除**
     # —— 被占用的库每次读取都永久漏一份（本机库可达数百 MB）。现在必须：

@@ -1965,8 +1965,11 @@ class _UsageHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # 挂在 server 上的上下文
-    # httpd.token / httpd.db / httpd.kind / httpd.days / httpd.session_id / httpd.limit
-    # httpd.lock / httpd.last / httpd.idle_seconds
+    #   token / db / lock / last / idle_seconds —— 请求处理要用
+    #   kind —— 只被 /api/ping 的身份应答读取
+    # 会话口径**不在**这里：它由每次请求的 query 决定（见 _request_options / _load）。
+    # 早前还挂着 days / session_id / limit，改成请求级参数后它们已无任何读取方，
+    # 故移除（Issue #19），避免后来者误以为设置它能生效。
 
     def log_message(self, fmt: str, *args) -> None:  # 静音默认 stderr 访问日志
         return
@@ -2163,9 +2166,6 @@ def create_usage_server(db: str, *, kind: str = "all", days: int = 30,
     httpd.token = token  # type: ignore[attr-defined]
     httpd.db = db  # type: ignore[attr-defined]
     httpd.kind = kind if kind in KINDS else "all"  # type: ignore[attr-defined]
-    httpd.days = days  # type: ignore[attr-defined]
-    httpd.session_id = session_id  # type: ignore[attr-defined]
-    httpd.limit = limit  # type: ignore[attr-defined]
     httpd.last = time.time()  # type: ignore[attr-defined]
     httpd.idle_seconds = max(1, int(idle_minutes)) * 60  # type: ignore[attr-defined]
     httpd.lock = threading.Lock()  # type: ignore[attr-defined]
