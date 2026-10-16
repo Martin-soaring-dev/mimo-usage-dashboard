@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """usage_cli.py — MiMo Desktop 本机用量统计（确定性本地命令，零 AI 参与）
 
@@ -2776,7 +2776,7 @@ def wait_for_server(token: str, timeout: float = 8.0) -> dict | None:
 
 
 def _await_live(token: str, *, rounds: int = 2, per_round: float = 8.0,
-                gap: float = 0.5) -> dict | None:
+                gap: float = 0.5, diag: dict | None = None) -> dict | None:
     """等待刚启动的实例就绪；一轮没等到就再等一轮。
 
     为什么需要重试：``wait_for_server`` 每次探测本身只有 1.2s 预算（身份探测必须与
@@ -2788,15 +2788,27 @@ def _await_live(token: str, *, rounds: int = 2, per_round: float = 8.0,
     for attempt in range(max(1, rounds)):
         live = wait_for_server(token, timeout=per_round)
         if live:
+            if diag is not None:
+                diag["probeRounds"] = attempt + 1
             return live
         if attempt + 1 < max(1, rounds):
             time.sleep(gap)
+    if diag is not None:
+        diag["probeRounds"] = max(1, rounds)
     return None
 
 
 def ensure_live_server(db: str, *, kind: str = "all", days: int = 30,
                        session_id: str | None = None, limit: int | None = None,
-                       idle_minutes: int = DEFAULT_IDLE_MINUTES) -> dict | None:
+                       idle_minutes: int = DEFAULT_IDLE_MINUTES,
+                       diag: dict | None = None) -> dict | None:
+    """确保本机实时服务可用；失败时返回 None。
+
+    ``diag`` 是可选的诊断出参：返回 None 时它会被填上 ``reason`` 与相关细节。
+    存在的理由：这个方法会**间歇性**失败（探测超时预算紧），而 CI 日志里只有一句
+    「返回 None」看不出走的是哪条分支，调参就变成猜。测试把 diag 打进失败信息里，
+    下一次复现即可直接定位。
+    """
     reused = try_reuse_server(db)
     if reused:
         return reused
@@ -2813,6 +2825,10 @@ def ensure_live_server(db: str, *, kind: str = "all", days: int = 30,
             reused = try_reuse_server(db)
             if reused:
                 return reused
+        if diag is not None:
+            diag.update(reason="lock-contention", lockPath=_lock_path(),
+                        lockAge=round(time.time() - os.path.getmtime(_lock_path()), 1)
+                        if os.path.exists(_lock_path()) else None)
         return None
     try:
         # 拿到锁后再查一次，避免排队期间实例已就绪
@@ -2825,13 +2841,23 @@ def ensure_live_server(db: str, *, kind: str = "all", days: int = 30,
                 db, kind=kind, days=days, session_id=session_id, limit=limit,
                 token=token, idle_minutes=idle_minutes,
             )
-        except Exception:
+        except Exception as exc:
+            if diag is not None:
+                diag.update(reason="spawn-error", error=f"{type(exc).__name__}: {exc}")
             return None
-        live = _await_live(token)
+        live = _await_live(token, diag=diag)
         if live:
             live["pid"] = live.get("pid") or pid
             return live
         # 重试后仍不就绪：此时才判定为半启动并尝试杀掉子进程
+        if diag is not None:
+            _st = read_server_state()
+            # stateTokenMatches 用来区分两种完全不同的原因：
+            #   ① 状态文件里根本不是我们要的 token（wait_for_server 永远不匹配）
+            #   ② 状态文件对了，但 /api/ping 一直探不通（子进程慢或端口异常）
+            diag.update(reason="spawn-not-ready", pidAlive=bool(pid and _pid_alive(int(pid))),
+                        stateFile=os.path.exists(server_state_path()),
+                        stateTokenMatches=bool(_st and _st.get("token") == token))
         try:
             if pid:
                 os.kill(pid, 9 if os.name == "nt" else 15)

@@ -1971,9 +1971,11 @@ print(json.dumps(live, ensure_ascii=False))
         bhttpd = None
         os.environ["MIMO_USAGE_DATA_DIR"] = big_spawn_data
 
-        e2e_live = U.ensure_live_server(big_db, idle_minutes=5)
+        _e2e_diag: dict = {}
+        e2e_live = U.ensure_live_server(big_db, idle_minutes=5, diag=_e2e_diag)
         check("大库：ensure_live_server 返回 live（原代码此处为 None）",
-              isinstance(e2e_live, dict) and bool(e2e_live.get("token")), f"({e2e_live})")
+              isinstance(e2e_live, dict) and bool(e2e_live.get("token")),
+              f"({e2e_live} | 失败诊断={_e2e_diag})")
         if isinstance(e2e_live, dict):
             check("大库：启动的子进程仍存活（没有被自己杀掉）",
                   U._pid_alive(int(e2e_live["pid"] or 0)), f"(pid={e2e_live.get('pid')})")
