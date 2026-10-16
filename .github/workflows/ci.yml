@@ -42,5 +42,9 @@ jobs:
         run: node test/ui-geometry.mjs --require-chrome
       - name: Live refresh e2e (headless browser, required)
         run: node test/refresh-e2e.mjs --require-chrome
+      # 用量范围两档开关是纯前端交互：Python 侧只能断言「HTML 里有没有这些元素」，
+      # 驱动不了点击、也验不到点完之后激活哪个标签、URL 变成什么。必须真实跑起来。
+      - name: Usage scope switch (headless browser, required)
+        run: node test/scope-switch.mjs --require-chrome
       - name: Package contents (dry run)
         run: npm pack --dry-run

@@ -54,10 +54,11 @@
     "test:ui-dom": "node test/ui-dom.mjs",
     "test:geometry": "node test/ui-geometry.mjs",
     "test:refresh": "node test/refresh-e2e.mjs",
+    "test:scope": "node test/scope-switch.mjs",
     "test:install": "powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1",
     "test:install-upgrade": "powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1",
     "test:live": "python test/e2e_live.py",
-    "test:all": "python test/test_python.py && python test/test_issue5.py && python test/test_installer.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs && node test/ui-geometry.mjs && node test/refresh-e2e.mjs && node test/cli.test.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1 && python test/e2e_live.py",
+    "test:all": "python test/test_python.py && python test/test_issue5.py && python test/test_installer.py && node test/runtime-check.mjs && node test/command-e2e.mjs && node test/ui-dom.mjs && node test/ui-geometry.mjs && node test/refresh-e2e.mjs && node test/scope-switch.mjs && node test/cli.test.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-smoke.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1 && python test/e2e_live.py",
     "test:installer": "python test/test_installer.py",
     "test:npm": "node test/cli.test.mjs"
   },
