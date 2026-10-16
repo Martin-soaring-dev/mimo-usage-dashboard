@@ -2003,6 +2003,39 @@ print(json.dumps(live, ensure_ascii=False))
                   not os.path.exists(os.path.join(fail_data, "live-server.json")))
         finally:
             U.spawn_serve_child = orig_spawn
+
+        # ---- H. 探测失败应重试（Issue #19：ensure_live_server 偶发返回 None） ----
+        # 实测现象：并发启动时 4 个 worker 里偶有 1 个拿到 None（实例其实下一秒就绪）。
+        # 根因是身份探测每轮只有 1.2s 预算，机器繁忙时整轮被击穿。修法是**重试探测**
+        # （不重复 spawn、不动超时常量）。这里注入「首轮探测必失败」把它钉死。
+        retry_data = os.path.join(tmpdir, "big-live-retry")
+        os.makedirs(retry_data, exist_ok=True)
+        os.environ["MIMO_USAGE_DATA_DIR"] = retry_data
+        _real_wfs = U.wait_for_server
+        _wfs = {"n": 0}
+
+        def _flaky_wait(token, timeout=8.0):
+            _wfs["n"] += 1
+            if _wfs["n"] == 1:
+                return None            # 模拟首轮探测被整体击穿
+            return _real_wfs(token, timeout=timeout)
+
+        retried = None
+        try:
+            U.wait_for_server = _flaky_wait
+            retried = U.ensure_live_server(big_db, idle_minutes=5)
+        finally:
+            U.wait_for_server = _real_wfs
+        check("Issue #19：首轮探测失败后重试，仍返回 live（不再回退成 None）",
+              isinstance(retried, dict) and bool(retried.get("token")),
+              f"(重试后拿到={bool(retried)}，探测被调用 {_wfs['n']} 次)")
+        check("Issue #19：确实发生了重试（探测被调用 ≥2 次）", _wfs["n"] >= 2, f"({_wfs['n']})")
+        if isinstance(retried, dict):
+            # 清掉本次 spawn 的实例，避免留下进程放大后续抖动
+            try:
+                U._request_shutdown(retried["port"], retried["token"], timeout=3.0)
+            except Exception:
+                pass
     finally:
         U.card_data = _real_card_data
         # 关掉本段的同进程服务，并**有界**等待其线程收尾：请求线程若还在跑 24MB
