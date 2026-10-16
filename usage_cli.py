@@ -20,6 +20,7 @@ path token、Host/Origin 校验、空闲自动退出；默认仍不联网、不�
     python usage_cli.py --out D:/x.html # 指定输出路径
     python usage_cli.py --shutdown      # 关闭本机实时服务
     python usage_cli.py service-check    # 只读报告实时服务身份（安装器 preflight 用）
+    python usage_cli.py reset-bindings   # 清除标签页会话定格（刷新后重新跟随最近活跃）
 
 仅依赖 Python 标准库（sqlite3 / json / html / argparse / http.server）。
 """
