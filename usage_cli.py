@@ -2775,6 +2775,25 @@ def wait_for_server(token: str, timeout: float = 8.0) -> dict | None:
     return None
 
 
+def _await_live(token: str, *, rounds: int = 2, per_round: float = 8.0,
+                gap: float = 0.5) -> dict | None:
+    """等待刚启动的实例就绪；一轮没等到就再等一轮。
+
+    为什么需要重试：``wait_for_server`` 每次探测本身只有 1.2s 预算（身份探测必须与
+    数据库规模无关，见 ``/api/ping`` 的注释）。机器繁忙时这一轮可能整体超时，
+    于是 ``ensure_live_server`` 返回 None —— 调用方会看到「起不来」，而实例其实
+    下一秒就绪。实测在并发启动下会间歇复现（本机同一测试连跑时 4 个 worker 里
+    偶有 1 个拿到 None）。这里只**重试探测**，不重复 spawn，也不动超时常量。
+    """
+    for attempt in range(max(1, rounds)):
+        live = wait_for_server(token, timeout=per_round)
+        if live:
+            return live
+        if attempt + 1 < max(1, rounds):
+            time.sleep(gap)
+    return None
+
+
 def ensure_live_server(db: str, *, kind: str = "all", days: int = 30,
                        session_id: str | None = None, limit: int | None = None,
                        idle_minutes: int = DEFAULT_IDLE_MINUTES) -> dict | None:
@@ -2782,10 +2801,15 @@ def ensure_live_server(db: str, *, kind: str = "all", days: int = 30,
     if reused:
         return reused
     if not _acquire_start_lock():
-        # 拿不到锁：另一进程正在启动。锁超时后仍短暂轮询复用，避免刚好
-        # 对方刚写完 state、自己却直接返回 None。
+        # 拿不到锁：另一进程正在启动。先按短间隔轮询，再按更宽的间隔补一轮 ——
+        # 仅仅「没拿到锁」说明不了对方失败，机器繁忙时它可能才刚写完 state。
         for _ in range(8):
             time.sleep(0.12)
+            reused = try_reuse_server(db)
+            if reused:
+                return reused
+        for _ in range(6):
+            time.sleep(0.4)
             reused = try_reuse_server(db)
             if reused:
                 return reused
@@ -2803,11 +2827,11 @@ def ensure_live_server(db: str, *, kind: str = "all", days: int = 30,
             )
         except Exception:
             return None
-        live = wait_for_server(token)
+        live = _await_live(token)
         if live:
             live["pid"] = live.get("pid") or pid
             return live
-        # 超时：尝试杀掉可能半启动的子进程
+        # 重试后仍不就绪：此时才判定为半启动并尝试杀掉子进程
         try:
             if pid:
                 os.kill(pid, 9 if os.name == "nt" else 15)
