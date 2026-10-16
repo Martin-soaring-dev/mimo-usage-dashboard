@@ -44,7 +44,7 @@ import time
 import webbrowser
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -555,12 +555,14 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
 
     conn, snap = _open_readonly(db_path)
     try:
+        explicit = session_id is not None
         sid = session_id
-        if sid:
-            if conn.execute("SELECT id FROM session WHERE id=?", (sid,)).fetchone() is None:
-                sid = None
-        if not sid:
-            r = conn.execute("SELECT id FROM session ORDER BY time_updated DESC LIMIT 1").fetchone()
+        if explicit:
+            if not sid or conn.execute("SELECT id FROM session WHERE id=?", (sid,)).fetchone() is None:
+                return {"ok": False, "error": f"指定的会话不存在：{sid}",
+                        "selectionMode": "fixed", "sessionId": sid}
+        else:
+            r = conn.execute("SELECT id FROM session ORDER BY time_updated DESC, id DESC LIMIT 1").fetchone()
             sid = r[0] if r else None
         if not sid:
             return {"ok": False, "error": "没有找到任何会话"}
@@ -686,6 +688,7 @@ def session_context(db_path: str, session_id: str | None = None, limit: int | No
         return {
             "ok": True,
             "sessionId": sid,
+            "selectionMode": "fixed" if explicit else "latest",
             "title": srow[1] or "(未命名)",
             "directory": srow[2] or "",
             "timeCreated": srow[3],
@@ -1457,7 +1460,8 @@ function contextCard(c){
 
   return '<div class="card"><div class="ctx-ring">' + ring +
     '<div style="flex:1;min-width:0">' +
-    '<div class="label">当前会话上下文占用</div>' +
+    '<div class="label">' + (c.selectionMode === "fixed" ? "已选择会话上下文占用" : "最近活跃会话上下文占用") + '</div>' +
+    '<div class="small muted">会话：' + esc(c.title) + ' · ' + esc((c.sessionId || "").slice(0, 12)) + '</div>' +
     '<div style="font-size:20px;font-weight:700">' + fmt(used) + ' <span class="small muted">/ ' + (limit ? fmt(limit) : "上限未知") + ' tokens</span></div>' +
     '<div class="bar" style="margin-top:10px">' + segs + '</div>' +
     '<div class="legend" style="margin:9px 0 0">' +
@@ -2017,9 +2021,11 @@ class _UsageHandler(BaseHTTPRequestHandler):
         try:
             if not rest or rest == ["index.html"]:
                 data = self._load()
+                query = self.path.partition("?")[2]
+                suffix = ("?" + query) if query else ""
                 live = {
-                    "reportUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/api/report",
-                    "pageUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/",
+                    "reportUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/api/report" + suffix,
+                    "pageUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/" + suffix,
                 }
                 html = render_html(data, live=live)
                 self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
@@ -2033,8 +2039,11 @@ class _UsageHandler(BaseHTTPRequestHandler):
                 # 身份探测必须与数据库规模无关 —— /api/report 每次请求都做全量聚合，
                 # 大库上远超探测超时，健康实例会被判为不可用（曾导致 --open 把自己
                 # 刚启动的子进程杀掉）。所以探测统一走这里。
-                self._json(200, {"app": LIVE_APP_ID, "kind": self.server.kind})  # type: ignore[attr-defined]
+                self._json(200, {"app": LIVE_APP_ID, "kind": self.server.kind, "requestSelection": 1})  # type: ignore[attr-defined]
                 return
+        except ValueError:
+            self._json(400, {"error": "invalid_query"})
+            return
         except FileNotFoundError:
             # 不回传 str(exc)：其中含数据库绝对路径，token 持有者也不应拿到
             self._json(503, {"error": "db_missing"})
@@ -2069,14 +2078,31 @@ class _UsageHandler(BaseHTTPRequestHandler):
             return
         self._json(404, {"error": "not_found"})
 
+    def _request_options(self) -> dict:
+        """Each dashboard URL owns its query; no mutable process-wide session selection."""
+        raw = self.path.partition("?")[2]
+        params = parse_qs(raw, keep_blank_values=True, max_num_fields=8)
+        if any(k not in ("session", "days", "limit", "kind") or len(v) != 1 for k, v in params.items()):
+            raise ValueError("无效或重复的看板查询参数")
+        session = params.get("session", ["latest"])[0]
+        if not session or len(session) > 256 or any(ord(c) < 32 for c in session):
+            raise ValueError("无效的会话 ID")
+        kind = params.get("kind", ["all"])[0]
+        if kind not in KINDS:
+            raise ValueError("无效视图")
+        try:
+            days = int(params.get("days", ["30"])[0])
+            limit_raw = params.get("limit", [""])[0]
+            limit = int(limit_raw) if limit_raw else None
+        except ValueError as exc:
+            raise ValueError("统计参数必须为整数") from exc
+        if not (1 <= days <= 36500) or (limit is not None and not (1 <= limit <= 10**12)):
+            raise ValueError("统计参数超出范围")
+        return dict(kind=kind, days=days,
+                    session_id=None if session == "latest" else session, limit=limit)
+
     def _load(self) -> dict:
-        return card_data(
-            self.server.db,  # type: ignore[attr-defined]
-            kind=self.server.kind,  # type: ignore[attr-defined]
-            days=self.server.days,  # type: ignore[attr-defined]
-            session_id=self.server.session_id,  # type: ignore[attr-defined]
-            limit=self.server.limit,  # type: ignore[attr-defined]
-        )
+        return card_data(self.server.db, **self._request_options())  # type: ignore[attr-defined]
 
 
 def create_usage_server(db: str, *, kind: str = "all", days: int = 30,
@@ -2445,6 +2471,14 @@ def try_reuse_server(db: str) -> dict | None:
             print("提示：live-server.json 指向的监听者不是本项目服务，已忽略该状态文件（未做任何强制动作）。",
                   file=sys.stderr)
         return None
+    # v0.2.0 servers do not understand request-scoped session selection.
+    # Only shut down an instance proven to be ours; otherwise a new caller could
+    # silently receive another session's context from the old process.
+    ping, ping_err = _fetch_json(_live_urls(status["port"], status["token"])["pageUrl"] + "api/ping", timeout=1.2)
+    if ping_err or not isinstance(ping, dict) or ping.get("requestSelection") != 1:
+        if not ping_err and _looks_like_our_ping(ping):
+            _request_shutdown(status["port"], status["token"])
+        return None
     st = read_server_state() or {}
     recorded_db = st.get("db")
     if recorded_db and os.path.abspath(str(recorded_db)) != os.path.abspath(db):
@@ -2740,7 +2774,11 @@ def main(argv=None) -> int:
         fh.write(html_doc)
 
     if args.open and live:
-        opened_url = live["pageUrl"]
+        query = {"session": args.session if args.session is not None else "latest",
+                 "days": args.days, "kind": args.kind if args.kind in KINDS else "all"}
+        if args.limit is not None:
+            query["limit"] = args.limit
+        opened_url = live["pageUrl"] + "?" + urlencode(query)
         try:
             webbrowser.open(opened_url)
         except Exception:

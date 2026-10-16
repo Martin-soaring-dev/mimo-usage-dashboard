@@ -316,6 +316,15 @@ def main() -> int:
     finally:
         U.os.path.expanduser = real_expanduser
         cleanup_temp(home_tmp, "隔离 home 目录")
+    # Issue #4: explicit selection must never silently switch to the newest session.
+    check("Issue #4：默认模式为 latest", ctx.get("selectionMode") == "latest")
+    fixed = U.session_context(db, session_id="s2")
+    check("Issue #4：指定 s2 保持固定模式",
+          fixed.get("sessionId") == "s2" and fixed.get("selectionMode") == "fixed")
+    missing = U.session_context(db, session_id="does-not-exist")
+    check("Issue #4：无效显式会话不回退到最新",
+          missing.get("ok") is False and missing.get("selectionMode") == "fixed"
+          and missing.get("sessionId") == "does-not-exist")
     check("ok=true", ctx.get("ok") is True)
     check("取最近活跃会话 s1", ctx["sessionId"] == "s1", f"({ctx.get('sessionId')})")
     check("占用取 step-finish = 2000", ctx["context"]["used"] == 2000, f"({ctx['context']['used']})")
@@ -1266,6 +1275,28 @@ def main() -> int:
             check("API 返回统计字段", all(k in got for k in ("kind", "token", "session", "context")))
             check("API 不泄露 dbPath", "dbPath" not in got)
 
+            # Issue #4: concurrent dashboard URLs must not inherit one global session.
+            from urllib.parse import urlencode as _qencode
+            def _report_for(**query):
+                with _ureq.urlopen(urls["reportUrl"] + "?" + _qencode(query), timeout=3) as rsp:
+                    return json.loads(rsp.read().decode("utf-8"))
+            a = _report_for(session="s1", days=7)
+            b = _report_for(session="s2", days=30)
+            a_again = _report_for(session="s1", days=7)
+            check("Issue #4：两个页面固定不同会话",
+                  a["context"]["sessionId"] == "s1" and b["context"]["sessionId"] == "s2"
+                  and a_again["context"]["sessionId"] == "s1")
+            check("Issue #4：各请求保留 days", a["token"]["windowKeys"] and "7" in a["token"]["windowKeys"])
+            check("Issue #4：固定查询带 selectionMode",
+                  a["context"]["selectionMode"] == b["context"]["selectionMode"] == "fixed")
+            invalid = _report_for(session="unknown-session")
+            check("Issue #4：API 缺失会话不降级",
+                  invalid["context"].get("ok") is False)
+            with _ureq.urlopen(urls["pageUrl"] + "?session=s1&days=7", timeout=3) as resp:
+                fixed_html = resp.read().decode("utf-8")
+            check("Issue #4：页面刷新 URL 保留会话选择",
+                  "session=s1&amp;days=7" in fixed_html or "session=s1&days=7" in fixed_html)
+
             with _ureq.urlopen(urls["pageUrl"], timeout=3) as resp:
                 page = resp.read().decode("utf-8")
             check("页面嵌入 LIVE.reportUrl", urls["reportUrl"] in page)
@@ -1626,8 +1657,10 @@ print(json.dumps(live, ensure_ascii=False))
         ping = json.loads(ping_text)
         check("ping 返回 200 且带固定 app 标识", ping.get("app") == U.LIVE_APP_ID, f"({ping})")
         check("ping 报告已知 kind", ping.get("kind") in U.KINDS, f"({ping.get('kind')})")
-        check("ping 只返回身份字段（没有多余信息可泄露）",
-              set(ping) == {"app", "kind"}, f"({ping})")
+        check("ping 只返回身份与能力字段（没有敏感信息）",
+              set(ping) == {"app", "kind", "requestSelection"}
+              and type(ping.get("requestSelection")) is int
+              and ping["requestSelection"] == 1, f"({ping})")
         check("ping 不回显 token", burls["token"] not in ping_text, f"({ping_text})")
         check("ping 不含数据库路径",
               "dbPath" not in ping_text and big_db not in ping_text and "bigcode" not in ping_text,
