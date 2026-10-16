@@ -57,6 +57,29 @@ class ContextLimitTests(unittest.TestCase):
         self.config({"provider": {"opencode-go": {"models": {"deepseek-flash": {"limit": {"context": -3}}}}}})
         self.assertEqual(U.model_context_limit("deepseek-flash", "opencode-go")[0], None)
 
+    def test_builtin_fallback_is_independent_of_unrelated_config(self):
+        """内置兜底不该受「机器上存在一个未声明该模型的配置文件」影响。
+
+        回归用例：早前的实现把内置兜底门控在 ``not found_config`` 上，于是同一份代码
+        在**有**配置的机器上（每个真实用户都有）返回 unknown、在**无**配置的机器上
+        （CI runner）返回内置值 —— CI 恒绿，本地却失败。
+        """
+        expected = (1048576, "builtin")
+        # 存在配置、但未声明该模型 → 仍应回落到内置表
+        self.config({"provider": {"someone-else": {"models": {"other": {"limit": {"context": 999}}}}}})
+        self.assertEqual(U.model_context_limit("mimo-v2.6-flash", "xiaomi-token-plan-cn"), expected)
+        # 删掉配置后，结果必须**完全相同** —— 证明它与机器上有没有配置文件无关
+        (self.home / ".config" / "mimocode" / "mimocode.jsonc").unlink()
+        self.assertEqual(U.model_context_limit("mimo-v2.6-flash", "xiaomi-token-plan-cn"), expected)
+
+    def test_broken_home_config_degrades_to_config_error(self):
+        """配置读取失败必须降级为 ``config-error``，而不是沿用内置表（unknown 优于 wrong）。"""
+        self.config("{ 这不是合法 JSONC ")
+        self.assertEqual(U.model_context_limit("mimo-v2.6-flash", "xiaomi-token-plan-cn"),
+                         (None, "config-error"))
+        # 损坏的配置不得把第三方 provider 也变成「内置已知」
+        self.assertEqual(U.model_context_limit("deepseek-flash", "opencode-go"), (None, "config-error"))
+
     def test_session_model_switch_and_explicit_limit(self):
         self.config({"provider": {
             "old-provider": {"models": {"old-model": {"limit": {"context": 1000}}}},
