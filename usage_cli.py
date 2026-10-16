@@ -1715,6 +1715,23 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "", live: dict | N
   // 当前视图 / 当前时间尺度。_WIN 为 null 时用 payload 的默认窗口（--days 对应的那一份）。
   var _TAB = (DATA.kind && DATA.kind !== "all") ? DATA.kind : "token";
   root.innerHTML = buildBody(DATA) + footer(DATA);
+  // Issue #16：把定格到的会话写进地址栏，便于复制或收藏复用（保留 tab 令牌）。
+  // 只在带 tab 令牌、且地址里仍写着 session=latest 时改写；静态快照（LIVE 为 null）不动；
+  // 拿不到 history / URL API 时静默跳过，页面照常显示。
+  (function(){{
+    try {{
+      if (!LIVE || !LIVE.pageUrl) return;
+      if (typeof history === "undefined" || !history.replaceState) return;
+      if (typeof URL === "undefined") return;
+      var sid = (DATA.context && DATA.context.sessionId) || "";
+      if (!sid) return;
+      var u = new URL(LIVE.pageUrl);
+      if (!u.searchParams.get("tab")) return;
+      if (u.searchParams.get("session") === sid) return;
+      u.searchParams.set("session", sid);
+      history.replaceState(null, "", u.pathname + u.search);
+    }} catch (e) {{ /* 布局/历史 API 不可用时静默跳过 */ }}
+  }})();
   // 事件委托挂 root：切换视图或时间尺度后 innerHTML 被重建，监听依然有效。
   wireHeatmap(root);
   wireTree(root);
@@ -2034,6 +2051,8 @@ class _UsageHandler(BaseHTTPRequestHandler):
                     }
                     if options["limit"] is not None:
                         spec["limit"] = options["limit"]
+                    if options.get("tab"):
+                        spec["tab"] = options["tab"]
                     suffix = "?" + urlencode(spec)
                 live = {
                     "reportUrl": f"http://{LOOPBACK_HOST}:{port}/{token}/api/report" + suffix,
@@ -2094,11 +2113,16 @@ class _UsageHandler(BaseHTTPRequestHandler):
         """Each dashboard URL owns its query; no mutable process-wide session selection."""
         raw = self.path.partition("?")[2]
         params = parse_qs(raw, keep_blank_values=True, max_num_fields=8)
-        if any(k not in ("session", "days", "limit", "kind") or len(v) != 1 for k, v in params.items()):
+        if any(k not in ("session", "days", "limit", "kind", "tab") or len(v) != 1
+               for k, v in params.items()):
             raise ValueError("无效或重复的看板查询参数")
         session = params.get("session", ["latest"])[0]
         if not session or len(session) > 256 or any(ord(c) < 32 for c in session):
             raise ValueError("无效的会话 ID")
+        # tab：一次 /usage-open 的定格令牌。字符集收紧，便于安全回显与去重。
+        tab = params.get("tab", [""])[0]
+        if tab and (len(tab) > 64 or any(c not in _BINDING_CHARS for c in tab)):
+            raise ValueError("无效的看板令牌")
         kind = params.get("kind", ["all"])[0]
         if kind not in KINDS:
             raise ValueError("无效视图")
@@ -2111,10 +2135,19 @@ class _UsageHandler(BaseHTTPRequestHandler):
         if not (1 <= days <= 36500) or (limit is not None and not (1 <= limit <= 10**12)):
             raise ValueError("统计参数超出范围")
         return dict(kind=kind, days=days,
-                    session_id=None if session == "latest" else session, limit=limit)
+                    session_id=None if session == "latest" else session, limit=limit,
+                    tab=tab or None)
 
     def _load(self) -> dict:
-        return card_data(self.server.db, **self._request_options())  # type: ignore[attr-defined]
+        options = self._request_options()
+        tab = options.pop("tab", None)
+        # 带 tab 且未显式指定会话时：用该 tab 定格的会话（首次请求即定格）。
+        # 显式 session=<id> 优先 —— URL 里写了 id 就以 URL 为准。
+        if tab and options["session_id"] is None:
+            frozen = frozen_session(self.server.db, tab)  # type: ignore[attr-defined]
+            if frozen:
+                options["session_id"] = frozen
+        return card_data(self.server.db, **options)  # type: ignore[attr-defined]
 
 
 def create_usage_server(db: str, *, kind: str = "all", days: int = 30,
@@ -2394,6 +2427,78 @@ def clear_server_state() -> None:
         os.unlink(server_state_path())
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# 标签页会话定格（Issue #16）
+# 每次 /usage-open 生成一个独立的 tab 令牌，首次带该令牌的请求把「此刻最近活跃的会话」
+# 定格下来，之后同一令牌一律用它 —— 于是同一个标签页刷新不再漂移。
+# 每个 tab 一个独立文件，避免读-改-写竞争；**绝不写入用量数据库**。
+# ---------------------------------------------------------------------------
+
+_BINDING_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def session_bindings_dir() -> str:
+    return os.path.join(default_data_dir(), "session-bindings")
+
+
+def _binding_path(tab: str) -> str:
+    return os.path.join(session_bindings_dir(), tab + ".json")
+
+
+def read_binding(tab: str) -> str | None:
+    """读某个 tab 已定格的会话 id；不存在或不可读时返回 None。"""
+    try:
+        with open(_binding_path(tab), "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    sid = obj.get("session_id") if isinstance(obj, dict) else None
+    return sid if isinstance(sid, str) and sid else None
+
+
+def write_binding(tab: str, session_id: str) -> None:
+    """原子写。失败不抛：定格失败只让这一页退回「最近活跃」，不该让看板不可用。"""
+    try:
+        path = _binding_path(tab)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + f".tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"session_id": session_id, "frozenAt": int(time.time() * 1000)},
+                      fh, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def frozen_session(db_path: str, tab: str) -> str | None:
+    """该 tab 定格的会话；若尚未定格，则把「此刻最近活跃」的会话定格下来。
+
+    注意语义：定格的是**打开那一刻的最近活跃会话**，不是「发起命令的会话」——
+    斜杠命令拿不到会话身份（见 Issue #17 的结论）。
+    """
+    known = read_binding(tab)
+    if known:
+        return known
+    conn, snap = _open_readonly(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id FROM session ORDER BY time_updated DESC, id DESC LIMIT 1").fetchone()
+        sid = row[0] if row else None
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        if snap:
+            _cleanup_snapshot(snap)
+    if not sid:
+        return None
+    write_binding(tab, str(sid))
+    return str(sid)
 
 
 def _lock_path() -> str:
@@ -2790,6 +2895,9 @@ def main(argv=None) -> int:
                  "days": args.days, "kind": args.kind if args.kind in KINDS else "all"}
         if args.limit is not None:
             query["limit"] = args.limit
+        # 每次 /usage-open 一个独立令牌（Issue #16）：URL 互不相同，可在不同标签页并存；
+        # 该页首次打开时服务端把「此刻最近活跃的会话」定格下来，之后刷新不再漂移。
+        query["tab"] = secrets.token_urlsafe(9)
         opened_url = live["pageUrl"] + "?" + urlencode(query)
         try:
             webbrowser.open(opened_url)
