@@ -1551,12 +1551,13 @@ function buildBody(data){
   // Issue #16 切片 2：用量范围两档开关。「会话用量」= 看被定格的会话；
   // 「全局用量」= 看全库聚合（与会话无关）。控件只负责切标签 + 把选择写进 URL 的
   // mode 参数（读写都在页内 glue 里完成），因此状态可见、且刷新后保持。
+  // 页面**只保留**「刷新数据」与「切换模式」两件事；清除定格走 CLI：
+  // `python usage_cli.py reset-bindings`。
   var scope = '<div class="seg" role="group" aria-label="用量范围" ' +
     'style="margin-top:10px;display:inline-flex">' +
     '<button type="button" data-scope="session" aria-pressed="false">会话用量</button>' +
     '<button type="button" data-scope="global" aria-pressed="false">全局用量</button>' +
-    '</div>' +
-    '<button class="btn" type="button" id="reset-pin" style="margin-left:8px">重置定格</button>';
+    '</div>';
   return nav + scope + '<div id="tab-content" role="tabpanel" aria-labelledby="tab-token">' +
     renderTab("token", data) + '</div>';
 }
@@ -1786,7 +1787,6 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "", live: dict | N
   (function(){{
     try {{
       var btns = root.querySelectorAll("[data-scope]");
-      var rst = document.getElementById("reset-pin");
       if (!btns.length) return;
       var pageUrl = (typeof LIVE !== "undefined" && LIVE) ? (LIVE.pageUrl || "") : "";
       var hasTab = false;
@@ -1798,8 +1798,6 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "", live: dict | N
           if (hasTab) curMode = (u0.searchParams.get("mode") === "global") ? "global" : "session";
         }}
       }} catch (e0) {{ /* 没有 URL API：退化为静态行为 */ }}
-      // 没有定格就没什么可重置：隐藏按钮而不是给一个点了没反应的入口。
-      if (rst && !hasTab) rst.hidden = true;
       var paint = function(mode){{
         btns.forEach(function(b){{
           b.setAttribute("aria-pressed", b.getAttribute("data-scope") === mode ? "true" : "false");
@@ -1825,19 +1823,6 @@ def render_html(data: dict, *, cmd: str = "", out_path: str = "", live: dict | N
           }} catch (e1) {{ /* 位置栏不变，页面仍按选择切换 */ }}
         }});
       }});
-      if (rst) {{
-        rst.addEventListener("click", function(){{
-          try {{
-            var u2 = new URL((typeof location !== "undefined" && location.href) ? location.href : pageUrl);
-            u2.searchParams.delete("tab");
-            u2.searchParams.delete("mode");
-            // 关键：地址栏里可能已经被写入了显式的 session=<定格到的 id>（见上面的
-            // replaceState）。只删 tab 不足以解除定格 —— 必须把它放回 latest。
-            u2.searchParams.set("session", "latest");
-            location.assign(u2.pathname + u2.search);
-          }} catch (e2) {{ /* ignore */ }}
-        }});
-      }}
       if (hasTab) {{ paint(curMode); goTab(curMode === "global" ? "token" : "context"); }}
     }} catch (e) {{ /* 控件不可用时静默跳过，页面照常显示 */ }}
   }})();
@@ -1855,6 +1840,10 @@ KNOWN_KINDS = ("all", "token", "session", "context")
 # "serve" / "service-check" 仅供本机进程间使用（安装器 preflight、测试、调试）；
 # 不进入用户 slash 命令白名单语义，但允许 CLI 直接调用。
 _INTERNAL_KINDS = ("serve", "service-check", "selfcheck")
+# 用户可显式调用的维护动作：不是视图 kind（不渲染页面），也不走 serve。
+# 目前只有一条：清除「标签页会话定格」（Issue #16）。放在 CLI 而不是页面上 ——
+# 页面只保留「刷新数据」与「切换模式」两件事。
+_MAINT_KINDS = ("reset-bindings",)
 _SAFE_FLAGS = {"--open", "--print-path", "--shutdown", "--help", "-h"}
 _SAFE_OPTS = {"--days", "--db", "--out", "--session", "--limit",
               "--token", "--idle-minutes", "--port", "--wait-seconds"}
@@ -1941,7 +1930,7 @@ def _sanitize_args(argv: list[str], dropped_out: list | None = None) -> list[str
             else:
                 out.extend((stripped, val))
             i += 1
-        elif stripped in KNOWN_KINDS or stripped in _INTERNAL_KINDS:
+        elif stripped in KNOWN_KINDS or stripped in _INTERNAL_KINDS or stripped in _MAINT_KINDS:
             out.append(stripped)
         elif stripped.startswith("-"):
             dropped.append(stripped)
@@ -2445,6 +2434,35 @@ def cmd_service_check() -> int:
     return 0
 
 
+def cmd_reset_bindings() -> int:
+    """`reset-bindings` 子命令：清除所有「标签页会话定格」（Issue #16）。
+
+    只删本项目自己在数据目录里写的绑定文件（每个标签页一个），**不碰用量数据库**、
+    也不动实时服务的状态文件。页面侧不再提供这个入口 —— 网页只保留「刷新数据」与
+    「切换模式」，重置走 CLI。
+    """
+    target = session_bindings_dir()
+    try:
+        names = os.listdir(target)
+    except FileNotFoundError:
+        print("没有需要清除的会话定格（尚未产生任何绑定）")
+        return 0
+    except OSError as exc:
+        print(f"MiMo 用量：无法读取会话定格目录（{exc}）", file=sys.stderr)
+        return 3
+    removed = 0
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            os.unlink(os.path.join(target, name))
+            removed += 1
+        except OSError:
+            continue
+    print(f"已清除 {removed} 个会话定格；刷新页面后会重新跟随最近活跃会话")
+    return 0
+
+
 def cmd_selfcheck() -> int:
     """`selfcheck` 内部子命令：**不读数据库、不写任何文件**的环境自检。
 
@@ -2848,7 +2866,8 @@ def main(argv=None) -> int:
         description="MiMo Desktop 本机用量统计（静态 HTML + 可选 loopback 实时刷新服务）",
     )
     parser.add_argument("kind", nargs="?", default="all",
-                        help="生成内容：all（默认）/ token / session / context / serve（内部）")
+                        help="生成内容：all（默认）/ token / session / context / serve（内部）"
+                             " / reset-bindings（清除标签页会话定格）")
     parser.add_argument("--days", type=int, default=30, help="token 统计最近多少天（默认 30）")
     parser.add_argument("--db", default=None, help="数据库路径（默认 ~/.local/share/mimocode/mimocode.db）")
     parser.add_argument("--out", default=None,
@@ -2887,9 +2906,10 @@ def main(argv=None) -> int:
               f"未执行任何操作。查看用法请用 --help", file=sys.stderr)
         return 2
 
-    # 内部子命令（serve / service-check）由显式词触发（固定 CLI，非 $ARGUMENTS）
+    # 内部子命令（serve / service-check / selfcheck）与维护动作（reset-bindings）
+    # 都由显式词触发（固定 CLI，非 $ARGUMENTS）；其它不在视图 KINDS 里的一律回落 all。
     raw_kind = argv[0] if argv and not argv[0].startswith("-") else "all"
-    is_internal = raw_kind in _INTERNAL_KINDS
+    is_internal = raw_kind in _INTERNAL_KINDS or raw_kind in _MAINT_KINDS
     args = parser.parse_args(argv)
     if is_internal:
         args.kind = raw_kind
@@ -2939,6 +2959,10 @@ def main(argv=None) -> int:
         clear_server_state()
         print("已关闭实时服务" + (f"（等待 {waited:.1f}s 退出）" if args.wait_seconds > 0 else ""))
         return 0
+
+    # ---- reset-bindings（维护动作：清除标签页会话定格） ----
+    if args.kind == "reset-bindings":
+        return cmd_reset_bindings()
 
     # ---- service-check（内部，只读） ----
     if args.kind == "service-check":
