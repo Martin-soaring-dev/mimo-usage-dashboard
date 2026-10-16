@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Regression coverage for Issue #5; no external dependencies."""
 import json
 import os
@@ -79,6 +79,34 @@ class ContextLimitTests(unittest.TestCase):
                          (None, "config-error"))
         # 损坏的配置不得把第三方 provider 也变成「内置已知」
         self.assertEqual(U.model_context_limit("deepseek-flash", "opencode-go"), (None, "config-error"))
+
+    def test_config_path_env_override(self):
+        """``MIMO_USAGE_CONFIG`` 覆盖默认配置路径，且**不回落**到家目录默认配置。
+
+        为什么需要这个开关：此前配置路径硬编码，隔离测试只能 monkeypatch ``expanduser``；
+        把配置放在非默认位置的使用者也取不到正确上限。本项目对数据库与数据目录
+        早有 ``MIMO_USAGE_DB`` / ``MIMO_USAGE_DATA_DIR``，配置路径缺一个。
+        """
+        alt = self.root / "elsewhere" / "my-mimocode.jsonc"
+        alt.parent.mkdir(parents=True, exist_ok=True)
+        alt.write_text(json.dumps({"provider": {"opencode-go": {"models": {
+            "deepseek-flash": {"limit": {"context": 424242}}}}}}), encoding="utf-8")
+        self.addCleanup(lambda: os.environ.pop("MIMO_USAGE_CONFIG", None))
+
+        os.environ["MIMO_USAGE_CONFIG"] = str(alt)
+        self.assertEqual(U.model_context_limit("deepseek-flash", "opencode-go"),
+                         (424242, "config"))
+
+        # 同时在家目录默认位置放一份**不同**的配置：覆盖生效时它必须被忽略
+        self.config({"provider": {"opencode-go": {"models": {
+            "deepseek-flash": {"limit": {"context": 999}}}}}})
+        self.assertEqual(U.model_context_limit("deepseek-flash", "opencode-go"),
+                         (424242, "config"))
+
+        # 覆盖指向**不存在**的文件时：不得回落去读家目录那份（unknown 优于读到别的机器的配置）
+        os.environ["MIMO_USAGE_CONFIG"] = str(self.root / "missing.jsonc")
+        self.assertEqual(U.model_context_limit("deepseek-flash", "opencode-go"),
+                         (None, "unknown"))
 
     def test_session_model_switch_and_explicit_limit(self):
         self.config({"provider": {

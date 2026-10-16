@@ -281,7 +281,7 @@ python usage_cli.py --open  # 手动查看
 - **报错 `找不到 MiMo 数据库`**：确认 MiMo Desktop 至少成功用过一次；或用 `--db` 指定路径 / 设 `MIMO_USAGE_DB`。
 - **报错找不到 Python**：装 Python ≥ 3.10，或显式指定解释器——`mimo-usage-dashboard install --python <路径>`（也可用环境变量 `MIMO_USAGE_PY`），走 PowerShell 路径时用 `install.ps1 -Python <路径>`。
 - **页面打不开**：确认文件已生成（CLI 会打印绝对路径）；或改用 `--open`。
-- **上下文显示「上限未知」**：该模型不在内置上限表里，只展示占用绝对值；可用 `--limit` 显式指定。
+- **上下文显示「上限未知」，或上限与 MiMo Desktop 自身不一致**：上限按 `(providerID, modelID)` 读配置里声明的 `limit.context`——先看 `~/.config/mimocode/mimocode.jsonc`，再看会话工作目录下的 `mimocode.jsonc` / `.mimocode/mimocode.jsonc`。配置里没声明、或配置读不到，就显示「上限未知」而**不会猜**（宁可未知，不给错值）。配置不在默认位置时用 `MIMO_USAGE_CONFIG` 指向它；也可用 `--limit` 为这一次调用显式指定。
 
 ## 卸载
 

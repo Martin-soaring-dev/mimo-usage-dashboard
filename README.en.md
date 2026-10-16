@@ -222,6 +222,7 @@ test/cli.test.mjs           npm pack → install → full CLI lifecycle, isolate
 - **`/usage` does nothing**: confirm `mimocode.jsonc` has `command.usage`, then **fully restart** MiMo Desktop and **open a new session** (the command table is built at session start).
 - **`MiMo database not found`**: make sure MiMo Desktop has run at least once; or pass `--db` / set `MIMO_USAGE_DB`.
 - **Python not found**: install Python ≥ 3.10, or point at an interpreter explicitly — `mimo-usage-dashboard install --python <path>` (or `MIMO_USAGE_PY`), or `install.ps1 -Python <path>` on the PowerShell path.
+- **The context card shows "limit unknown", or a limit that disagrees with MiMo Desktop**: the limit is read per `(providerID, modelID)` from the `limit.context` your config declares — first `~/.config/mimocode/mimocode.jsonc`, then `mimocode.jsonc` / `.mimocode/mimocode.jsonc` in the session working directory. If your config does not declare the model, or cannot be read, the card says "limit unknown" rather than guessing (unknown beats wrong). Point `MIMO_USAGE_CONFIG` at your config if it lives elsewhere, or pass `--limit` to override it for one run.
 
 ## Uninstall
 
