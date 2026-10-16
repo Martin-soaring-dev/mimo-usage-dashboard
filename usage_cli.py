@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """usage_cli.py — MiMo Desktop 本机用量统计（确定性本地命令，零 AI 参与）
 
@@ -196,7 +196,12 @@ def model_context_limit(model_id: str | None, provider_id: str | None = None,
     """
     if not model_id or not provider_id:
         return None, "unknown"
-    home = os.path.join(os.path.expanduser("~"), ".config", "mimocode", "mimocode.jsonc")
+    # 配置路径可用 MIMO_USAGE_CONFIG 覆盖（与 MIMO_USAGE_DB / MIMO_USAGE_DATA_DIR 同一约定）：
+    # 便于隔离测试，也让把配置放在非默认位置的使用者能取到正确上限。
+    # 注意这是**替换**而不是追加：覆盖指向的文件不存在时**不会**回落到家目录默认配置，
+    # 否则隔离测试会读到机器的真实配置（正是这条缺口的由来）。
+    home = os.environ.get("MIMO_USAGE_CONFIG") or os.path.join(
+        os.path.expanduser("~"), ".config", "mimocode", "mimocode.jsonc")
     paths = [home]
     if directory:
         paths.append(os.path.join(directory, "mimocode.jsonc"))
