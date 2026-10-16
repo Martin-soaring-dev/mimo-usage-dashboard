@@ -286,6 +286,76 @@ try {
   check("悬停最右侧格子不触发 .cols 横向溢出",
     !!hoverOver && hoverOver.hovered && hoverOver.over === 0,
     hoverOver ? `(hovered=${hoverOver.hovered} client=${hoverOver.client} scroll=${hoverOver.scroll} 溢出=${hoverOver.over})` : "(no cell)");
+
+  // ---------- UI-1b（Issue #19 / N4-B）：提示**文字**必须真的落在提示框内 ----------
+  // 上面几条量的是提示层**元素**（getBoundingClientRect）与视口的关系，以及 .cell 的溢出；
+  // 当 max-width 与 white-space 失配时，元素框仍被钳在 max-width 内、**文字**却溢出框外，
+  // 于是那些断言在修复前后输出完全相同（PR #11 修复前的真实症状）。
+  // 这里改用 Range 量文字真实矩形，与提示框矩形比对，把该症状钉死。
+  console.log("\n-- UI-1b 提示文字边界（文字矩形 vs 提示框矩形）--");
+  const tipTextMetrics = async (selector) => {
+    const box = JSON.parse(await page.eval(
+      `(() => { const el = ${selector}; if (!el) return "null";
+        const r = el.getBoundingClientRect();
+        return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 }); })()`));
+    if (!box) return null;
+    await page.moveMouse(box.x, box.y);
+    return JSON.parse(await page.eval(
+      `(() => { const t = document.getElementById('hm-tip');
+        if (!t || t.hidden) return JSON.stringify({ exists: false });
+        const br = t.getBoundingClientRect();
+        const rg = document.createRange(); rg.selectNodeContents(t);
+        const tr = rg.getBoundingClientRect();
+        return JSON.stringify({ exists: true, text: t.textContent,
+          boxLeft: br.left, boxRight: br.right, boxBottom: br.bottom,
+          textLeft: tr.left, textRight: tr.right, textBottom: tr.bottom,
+          textW: tr.width, boxW: br.width,
+          scrollW: t.scrollWidth, clientW: t.clientWidth,
+          whiteSpace: getComputedStyle(t).whiteSpace, vw: window.innerWidth }); })()`));
+  };
+  // 挑「文案最长、且最靠右、且完全落在视口内」的有数据格子 —— 这是溢出最严重的组合。
+  // 必须限制在完全可见的格子里：窄视口下最右列的格子可能被容器裁掉，鼠标落点命中不到它。
+  const worstTipCell = `(() => {
+    const cells = [...document.querySelectorAll('.hm .cell')].filter((c) => {
+      if (c.getAttribute('data-lv') === '0') return false;
+      const r = c.getBoundingClientRect();
+      return r.left >= 0 && r.right <= window.innerWidth && r.top >= 0 && r.bottom <= window.innerHeight;
+    });
+    if (!cells.length) return null;
+    let best = cells[0];
+    for (const c of cells) {
+      const len = (c.getAttribute('data-tip') || '').length;
+      const bestLen = (best.getAttribute('data-tip') || '').length;
+      if (len >= bestLen) best = c;
+    }
+    return best;
+  })()`;
+  for (const w of [1200, 900]) {
+    await page.viewport(w, 2600);
+    // 每个宽度都用 fresh 页面。提示框是 position:fixed + shrink-to-fit，其可用宽度
+    // = 视口宽 − 自身 left；跨视口复用同一页面时，上一轮遗留的 inline left 会让宽度
+    // 塌陷并被反向锁死（独立缺陷，另案记录）。本断言只判定「文字是否落在框内」，
+    // 必须在干净状态下测，否则测到的是那条缺陷的副作用。
+    await page.goto(fileUrl(htmlFile), 700);
+    const m = await tipTextMetrics(worstTipCell);
+    if (!m || !m.exists) {
+      check(`${w}px: 悬停最右侧有数据格显示提示层`, false, "(no tip layer)");
+      continue;
+    }
+    check(`${w}px: 提示文字不超出提示框右缘`, m.textRight <= m.boxRight + 0.5,
+      `(textRight=${m.textRight.toFixed(1)} boxRight=${m.boxRight.toFixed(1)}`
+      + ` 溢出=${(m.textRight - m.boxRight).toFixed(1)}px textW=${m.textW.toFixed(1)} boxW=${m.boxW.toFixed(1)}`
+      + ` text=${JSON.stringify(m.text.slice(0, 46))})`);
+    check(`${w}px: 提示文字不超出提示框下缘`, m.textBottom <= m.boxBottom + 0.5,
+      `(textBottom=${m.textBottom.toFixed(1)} boxBottom=${m.boxBottom.toFixed(1)})`);
+    check(`${w}px: 提示框无横向内容溢出`, m.scrollW <= m.clientW + 1,
+      `(scrollW=${m.scrollW} clientW=${m.clientW} white-space=${m.whiteSpace})`);
+    check(`${w}px: 提示框本身仍在视口内`, m.boxLeft >= -0.5 && m.boxRight <= m.vw + 1,
+      `(l=${m.boxLeft.toFixed(1)} r=${m.boxRight.toFixed(1)} vw=${m.vw})`);
+  }
+  // 恢复：后续用例依赖 1200px + 干净页面
+  await page.viewport(1200, 2600);
+  await page.goto(fileUrl(htmlFile), 900);
   await page.moveMouse(4, 4);
 
   // ---------- UI-2：星期标签对齐 ----------
