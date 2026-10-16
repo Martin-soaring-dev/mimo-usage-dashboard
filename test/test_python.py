@@ -1302,6 +1302,86 @@ def main() -> int:
             check("页面嵌入 LIVE.reportUrl", urls["reportUrl"] in page)
             check("页面按钮为「刷新数据」", "刷新数据" in page)
 
+            # ---- Issue #16：唯一 URL + 首次打开定格 ----
+            # 用独立 fixture（5 个会话），模拟「每个会话各触发一次 /usage-open」：
+            # 每次触发前先把该会话置为最新活跃，再带一个全新的 tab 令牌请求。
+            from urllib.parse import urlencode as _qencode16
+            freeze_db = os.path.join(tmpdir, "freeze.db")
+            fcon = sqlite3.connect(freeze_db)
+            fcon.executescript(SCHEMA_SQL)
+            fnow = int(time_module.time() * 1000)
+            for _i in range(5):
+                _ts = fnow - (5 - _i) * 60_000
+                fcon.execute(
+                    "INSERT INTO session (id,title,directory,time_created,time_updated,"
+                    "summary_additions,summary_deletions,summary_files) VALUES (?,?,?,?,?,0,0,0)",
+                    (f"t{_i}", f"会话{_i}", f"D:/p/{_i}", _ts - 60_000, _ts))
+            fcon.commit()
+            fcon.close()
+
+            fhttpd = U.create_usage_server(freeze_db, idle_minutes=10)
+            furls = U.live_urls(fhttpd)
+            _th.Thread(target=fhttpd.serve_forever, kwargs={"poll_interval": 0.05},
+                       daemon=True).start()
+            try:
+                def _report16(tab, **q):
+                    q.setdefault("session", "latest")
+                    q["tab"] = tab
+                    try:
+                        with _ureq.urlopen(furls["reportUrl"] + "?" + _qencode16(q), timeout=3) as rsp:
+                            return json.loads(rsp.read().decode("utf-8"))["context"]["sessionId"]
+                    except _uerr.HTTPError as exc:
+                        # 把状态码带回来，让断言失败可诊断（而不是抛栈中断整套测试）
+                        return f"HTTP {exc.code}"
+
+                def _touch16(sid, ms):
+                    c16 = sqlite3.connect(freeze_db)
+                    c16.execute("UPDATE session SET time_updated=? WHERE id=?", (ms, sid))
+                    c16.commit()
+                    c16.close()
+
+                seen = []
+                for _i in range(5):
+                    # 会话 t<i> 刚活动过 → 它就是「此刻最近活跃」→ 它触发 /usage-open
+                    _touch16(f"t{_i}", int(time_module.time() * 1000) + _i + 1)
+                    seen.append(_report16(f"tab{_i}"))
+                check("Issue #16：5 个会话各触发一次 → 定格到 5 个不同会话（不全是同一个）",
+                      len(set(seen)) == 5 and seen == [f"t{_i}" for _i in range(5)], f"({seen})")
+
+                # 定格之后让别的会话变成最新：同一 tab 刷新必须**不漂移**
+                _touch16("t4", int(time_module.time() * 1000) + 9_999_999)
+                again = _report16("tab0")
+                check("Issue #16：定格后刷新不漂移（同一 tab 仍是原会话）",
+                      again == seen[0] and not again.startswith("HTTP"),
+                      f"(首次={seen[0]} 现在={again})")
+                fresh = _report16("tabFresh")
+                check("Issue #16：新 tab 取当前最近活跃（与旧 tab 不同）",
+                      fresh == "t4" and fresh != seen[0], f"(fresh={fresh} 旧={seen[0]})")
+
+                with _ureq.urlopen(
+                        furls["pageUrl"] + "?session=latest&days=30&kind=all&tab=pageTab16",
+                        timeout=3) as resp:
+                    fpage = resp.read().decode("utf-8")
+                check("Issue #16：页面把 tab 令牌带进 LIVE（刷新不会丢掉定格）",
+                      "tab=pageTab16" in fpage)
+                check("Issue #16：页面带地址栏定格脚本（把 session 写实，便于复制复用）",
+                      "replaceState" in fpage)
+
+                try:
+                    _ureq.urlopen(furls["reportUrl"] + "?tab=bad%20tab", timeout=3)
+                    check("Issue #16：非法 tab 令牌被拒（400）", False, "(未拒绝)")
+                except _uerr.HTTPError as e16:
+                    check("Issue #16：非法 tab 令牌被拒（400）", e16.code == 400, f"(code={e16.code})")
+            finally:
+                try:
+                    _ureq.urlopen(_ureq.Request(
+                        furls["reportUrl"].rsplit("/api/", 1)[0] + "/api/shutdown",
+                        method="POST", data=b""), timeout=3)
+                except Exception:
+                    pass
+                fhttpd.shutdown()
+                fhttpd.server_close()
+
             # 错误 token → 404
             bad = urls["reportUrl"].replace(urls["token"], "AAAAAAAAAAAAAAAAAAAAAA")
             try:
