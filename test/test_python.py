@@ -1407,9 +1407,9 @@ def main() -> int:
                         timeout=3) as resp:
                     swpage = resp.read().decode("utf-8")
                 check("Issue #16：mode 随页面回显（刷新保持所选档位）", "mode=global" in swpage)
-                check("Issue #16：页面含两档开关与重置定格入口",
+                check("Issue #16：页面只有两档开关与刷新（重置走 CLI，页面上不再有入口）",
                       'data-scope="session"' in swpage and 'data-scope="global"' in swpage
-                      and 'id="reset-pin"' in swpage and "重置定格" in swpage)
+                      and 'id="reset-pin"' not in swpage and "重置定格" not in swpage)
 
                 # 绑定生命周期：过期文件在写入路径上被顺带回收（避免一 tab 一文件无限增长）
                 _stale = os.path.join(U.session_bindings_dir(), "staleTab16.json")
@@ -1420,6 +1420,17 @@ def main() -> int:
                 _report16("tabPrune16")
                 check("Issue #16：过期绑定被回收（映射表不会无限增长）",
                       not os.path.exists(_stale), f"({_stale})")
+
+                # reset-bindings：清除定格的 CLI 子指令（页面不再提供该入口）
+                _bdir = U.session_bindings_dir()
+                _cnt = lambda: (len([n for n in os.listdir(_bdir) if n.endswith(".json")])
+                                if os.path.isdir(_bdir) else 0)
+                check("Issue #16：reset-bindings 之前确实存在绑定文件", _cnt() >= 1, f"({_cnt()})")
+                _rc = U.main(["reset-bindings"])
+                check("Issue #16：reset-bindings 清空所有定格绑定（退出码 0）",
+                      _rc == 0 and _cnt() == 0, f"(rc={_rc} 剩余={_cnt()})")
+                check("Issue #16：清除后同一 tab 会重新定格到当前最近活跃（不再沿用旧绑定）",
+                      _report16("tab0") == "t4", f"(重新定格={_report16('tab2')})")
             finally:
                 try:
                     _ureq.urlopen(_ureq.Request(
