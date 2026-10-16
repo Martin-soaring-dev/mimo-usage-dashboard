@@ -56,20 +56,16 @@ LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_IDLE_MINUTES = 240  # 无请求后自动退出，避免孤儿进程
 
 # 已知模型的上下文窗口（tokens）。取自 MiMo 引擎内置模型表；DB 内不存该值。
-# 匹配规则：精确 id 优先，其次最长前缀（处理 -0731 / -preview 等后缀变体）。
+# 只保留**可达**的条目：兜底仅在「provider 是 xiaomi-token-plan-cn、model 以 mimo- 开头、
+# 且配置没有声明该模型」时生效（见 model_context_limit）。非 first-party 模型的上限由用户
+# 配置权威给出；把它们的值留在这里永远不会被读到，只会让人误以为生效（Issue #19）。
+# 匹配是**精确 id**：不再做前缀匹配（随上下文上限改造一并移除，避免「猜」）。
 MODEL_CONTEXT_LIMITS: dict[str, int] = {
     "mimo-v2.6-pro": 1048576,
     "mimo-v2.6-flash": 1048576,
     "mimo-v2.5": 1048576,
     "mimo-v2-pro": 1048576,
     "mimo-v2-flash": 262144,
-    "deepseek-v4.1-flash": 131072,
-    "deepseek-v4-flash": 131072,
-    "deepseek-v4-flash-0731": 131072,
-    "deepseek-flash": 131072,
-    "glm-5.3": 1000000,
-    "claude-sonnet-4-6": 200000,
-    "claude-opus-4-8": 200000,
 }
 
 KINDS = ("all", "token", "session", "context")

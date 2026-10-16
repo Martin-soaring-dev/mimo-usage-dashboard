@@ -108,6 +108,20 @@ class ContextLimitTests(unittest.TestCase):
         self.assertEqual(U.model_context_limit("deepseek-flash", "opencode-go"),
                          (None, "unknown"))
 
+    def test_builtin_table_has_no_unreachable_entries(self):
+        """内置表不得留「永远不可能命中」的条目（Issue #19）。
+
+        兜底只在 provider 是 ``xiaomi-token-plan-cn`` 且 model 以 ``mimo-`` 开头时生效，
+        所以任何非 ``mimo-`` 的键都**不可能被读到**——留着只会让人误以为生效，
+        与刚清理掉的「写了但无人读」的服务端死状态是同一类问题。
+        """
+        dead = sorted(k for k in U.MODEL_CONTEXT_LIMITS if not k.startswith("mimo-"))
+        self.assertEqual(dead, [], f"不可达条目：{dead}")
+
+        # 行为侧确认：非 first-party 模型即便 provider 正确也取不到内置值（宁未知不猜）
+        self.assertEqual(U.model_context_limit("glm-5.3", "xiaomi-token-plan-cn"),
+                         (None, "unknown"))
+
     def test_session_model_switch_and_explicit_limit(self):
         self.config({"provider": {
             "old-provider": {"models": {"old-model": {"limit": {"context": 1000}}}},
