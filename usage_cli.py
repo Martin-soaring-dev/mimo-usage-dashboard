@@ -2856,8 +2856,13 @@ def ensure_live_server(db: str, *, kind: str = "all", days: int = 30,
             # stateTokenMatches 用来区分两种完全不同的原因：
             #   ① 状态文件里根本不是我们要的 token（wait_for_server 永远不匹配）
             #   ② 状态文件对了，但 /api/ping 一直探不通（子进程慢或端口异常）
+            # statePid 再把 ① 拆开：等于 spawnedPid 说明我们自己 spawn 的子进程
+            # 写了状态却不应答；不等则说明状态被别的实例覆盖了（并发下的抢占）。
+            # 没有这一项时，两种情形在日志里长得一模一样，只能靠猜。
             diag.update(reason="spawn-not-ready", pidAlive=bool(pid and _pid_alive(int(pid))),
                         stateFile=os.path.exists(server_state_path()),
+                        spawnedPid=pid,
+                        statePid=int((_st or {}).get("pid") or 0) or None,
                         stateTokenMatches=bool(_st and _st.get("token") == token))
         try:
             if pid:

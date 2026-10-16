@@ -1651,12 +1651,16 @@ def main() -> int:
         os.makedirs(conc_data, exist_ok=True)
         conc_db = os.path.join(tmpdir, "conc.db")
         make_db(conc_db, int(time_module.time() * 1000))
+        # worker 输出单行 JSON：{"live": <live 或 null>, "diag": <诊断>}。
+        # 带上 diag 是有意的：ensure_live_server 的间歇性 None 恰恰在并发启动下
+        # 复现（见 _await_live 的注释），没有诊断时失败信息只剩一句 (None)。
         worker = f"""
 import json, os, sys
 sys.path.insert(0, {json.dumps(ROOT)})
 import usage_cli as U
-live = U.ensure_live_server(sys.argv[1], idle_minutes=5)
-print(json.dumps(live, ensure_ascii=False))
+diag = {{}}
+live = U.ensure_live_server(sys.argv[1], idle_minutes=5, diag=diag)
+print(json.dumps({{"live": live, "diag": diag}}, ensure_ascii=False))
 """
         conc_env = os.environ.copy()
         conc_env["MIMO_USAGE_DATA_DIR"] = conc_data
@@ -1685,14 +1689,17 @@ print(json.dumps(live, ensure_ascii=False))
                 outs.append((o or "").strip())
             check("4 个并发 ensure_live_server 均退出 0", all(c == 0 for c in codes), f"({codes})")
             lives = []
+            conc_diags = []
             for raw in outs:
                 line = next((ln for ln in raw.splitlines() if ln.startswith("{")), "")
                 try:
-                    lives.append(json.loads(line) if line else None)
+                    obj = json.loads(line) if line else {}
                 except json.JSONDecodeError:
-                    lives.append(None)
+                    obj = {}
+                lives.append(obj.get("live"))
+                conc_diags.append(obj.get("diag") or {})
             check("4 个并发调用均拿到 live 对象", all(isinstance(x, dict) and x.get("token") for x in lives),
-                  f"({lives})")
+                  f"({lives} | 失败诊断={[d for d, ok in zip(conc_diags, lives) if not isinstance(ok, dict)]})")
             tokens = {(x or {}).get("token") for x in lives}
             ports = {(x or {}).get("port") for x in lives}
             check("并发结果收敛到同一 token（无错配）", len(tokens) == 1 and None not in tokens, f"({tokens})")
@@ -1719,6 +1726,7 @@ print(json.dumps(live, ensure_ascii=False))
                     for _ in range(3)
                 ]
                 tokens2 = set()
+                reuse_diags = []
                 reuse_ok = True
                 for p in procs2:
                     try:
@@ -1732,11 +1740,14 @@ print(json.dumps(live, ensure_ascii=False))
                         obj = json.loads(line) if line else {}
                     except json.JSONDecodeError:
                         obj = {}
-                    tokens2.add(obj.get("token"))
-                    if p.returncode != 0 or not obj.get("reused"):
+                    reuse_diags.append(obj.get("diag") or {})
+                    reuse_obj = obj.get("live") or {}
+                    tokens2.add(reuse_obj.get("token"))
+                    if p.returncode != 0 or not reuse_obj.get("reused"):
                         reuse_ok = False
                 check("第二波并发全部复用同一实例（reused=true）",
-                      reuse_ok and tokens2 == tokens, f"(tokens={tokens2}, reused_ok={reuse_ok})")
+                      reuse_ok and tokens2 == tokens,
+                      f"(tokens={tokens2}, reused_ok={reuse_ok}, 失败诊断={reuse_diags})")
             # 清理：用状态文件里的 token 请求 shutdown，并验证身份后再清 state
             try:
                 if st_conc and st_conc.get("token"):
