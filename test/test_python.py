@@ -1384,6 +1384,42 @@ def main() -> int:
                     check("Issue #16：非法 tab 令牌被拒（400）", False, "(未拒绝)")
                 except _uerr.HTTPError as e16:
                     check("Issue #16：非法 tab 令牌被拒（400）", e16.code == 400, f"(code={e16.code})")
+
+                # ---- Issue #16 切片 2：用量范围两档（会话用量 / 全局用量）----
+                _touch16("t4", int(time_module.time() * 1000) + 20_000_000)  # 让 t4 成为当前最新
+                glob16 = _report16("tab0", mode="global")
+                sess16 = _report16("tab0", mode="session")
+                check("Issue #16：全局档绕过定格（取当前最近活跃，不锁定格会话）",
+                      glob16 == "t4", f"(global={glob16})")
+                check("Issue #16：会话档用定格（同一 tab 仍是原会话）",
+                      sess16 == seen[0], f"(session={sess16} 首次={seen[0]})")
+                check("Issue #16：两档结果确实不同（否则这个开关没有意义）",
+                      glob16 != sess16, f"(global={glob16} session={sess16})")
+
+                try:
+                    _ureq.urlopen(furls["reportUrl"] + "?mode=bogus", timeout=3)
+                    check("Issue #16：非法 mode 被拒（400）", False, "(未拒绝)")
+                except _uerr.HTTPError as e16b:
+                    check("Issue #16：非法 mode 被拒（400）", e16b.code == 400, f"(code={e16b.code})")
+
+                with _ureq.urlopen(
+                        furls["pageUrl"] + "?session=latest&days=30&kind=all&tab=sw1&mode=global",
+                        timeout=3) as resp:
+                    swpage = resp.read().decode("utf-8")
+                check("Issue #16：mode 随页面回显（刷新保持所选档位）", "mode=global" in swpage)
+                check("Issue #16：页面含两档开关与重置定格入口",
+                      'data-scope="session"' in swpage and 'data-scope="global"' in swpage
+                      and 'id="reset-pin"' in swpage and "重置定格" in swpage)
+
+                # 绑定生命周期：过期文件在写入路径上被顺带回收（避免一 tab 一文件无限增长）
+                _stale = os.path.join(U.session_bindings_dir(), "staleTab16.json")
+                with open(_stale, "w", encoding="utf-8") as _fh:
+                    json.dump({"session_id": "t0", "frozenAt": 0}, _fh)
+                _aged = time_module.time() - 40 * 86400
+                os.utime(_stale, (_aged, _aged))
+                _report16("tabPrune16")
+                check("Issue #16：过期绑定被回收（映射表不会无限增长）",
+                      not os.path.exists(_stale), f"({_stale})")
             finally:
                 try:
                     _ureq.urlopen(_ureq.Request(
