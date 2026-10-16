@@ -158,7 +158,18 @@ python usage_cli.py --open
 python usage_cli.py --out D:/x.html
 python usage_cli.py --db <path>
 python usage_cli.py --print-path
+python usage_cli.py reset-bindings      # clear the per-tab session freeze (see below)
 ```
+
+**About the session freeze**: every `/usage-open` opens a **distinct URL**. The first time that URL is loaded, the dashboard pins whatever session was most recently active at that moment to that URL. The tab then keeps showing that session on refresh instead of silently switching to another one, and the address bar carries the pinned session id so the URL can be copied or bookmarked.
+
+The page itself offers **only refresh and the usage-scope switch**; to release the freeze — for instance when it pinned a session that had merely been active just before — use the CLI:
+
+```bash
+python usage_cli.py reset-bindings
+```
+
+The **session / global** switch below the tab bar picks what is shown: the frozen session, or the whole-database aggregate (which is session-independent). Note that the freeze captures the **most recently active session at open time**, which is **not** the same as the session that ran the command — slash commands cannot obtain session identity, as measured.
 
 ### Refresh
 
