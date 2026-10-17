@@ -402,8 +402,14 @@ mimo-usage-dashboard uninstall
 
 只想手工清理也可以：注销命令后删除 `~/.config/mimocode/usage-dashboard/` 与配置里的 `command.usage` / `command.usage-open`。
 
+## 致谢
+
+感谢 **小米 MiMo 模型**与 **MiMo Desktop / MiMoCode** 团队。MiMo Desktop 的实际使用体验启发了本项目，而其本地命令扩展机制使通过 `/usage`、`/usage-open` 调用统计程序成为可能。
+
+本项目也希望以一份独立的社区作品，为 MiMo Desktop 用户提供更直观的 Token、缓存和上下文用量观察方式。感谢开发者社区持续分享使用经验与反馈。
+
+> **声明**：本项目由社区开发者独立开发与维护，并非小米或 MiMo 官方产品；上述致谢不代表官方赞助、认可或合作关系。
+
 ## License
 
 MIT © Martin-soaring-dev
-
-> 本项目为**非官方**第三方工具，与小米 / MiMo 无关。
