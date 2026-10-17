@@ -34,7 +34,18 @@ jobs:
       # manifest 缺失时的 fail-closed / JSONC 原地修改保持注释 / 运行服务升级。
       - name: Windows installer upgrade & rollback tests
         run: powershell -NoProfile -ExecutionPolicy Bypass -File test/install-upgrade.ps1
-      - run: npm test
+      # 拆开 Python 与 Node 回归，失败时在 Actions 步骤级直接定位责任域。
+      # 与 package.json 中 npm test 的执行清单和顺序保持一致。
+      - name: Python usage and live-server regressions
+        run: python test/test_python.py
+      - name: Python context-limit regressions
+        run: python test/test_issue5.py
+      - name: Node runtime regressions
+        run: node test/runtime-check.mjs
+      - name: Node slash-command E2E
+        run: node test/command-e2e.mjs
+      - name: Node DOM regressions
+        run: node test/ui-dom.mjs
       # UI 几何回归必须真实跑起来：--require-chrome 把「没有浏览器」变成显式失败（exit 1），
       # 绝不允许缺依赖时静默 SKIP 却让 CI 显示绿色。windows-latest 镜像预装 Chrome/Edge，
       # cdp.mjs 会依次探测 CHROME_PATH 与 Chrome/Edge 的标准安装路径。
