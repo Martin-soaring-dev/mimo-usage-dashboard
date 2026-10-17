@@ -238,8 +238,14 @@ mimo-usage-dashboard uninstall
 
 Manually: unregister the commands, then delete `~/.config/mimocode/usage-dashboard/` and the `command.usage` / `command.usage-open` entries.
 
+## Acknowledgements
+
+Thanks to the teams behind **Xiaomi MiMo models** and **MiMo Desktop / MiMoCode**. The everyday experience of using MiMo Desktop inspired this project, and its local custom-command mechanism made it possible to integrate `/usage` and `/usage-open` with a local analytics tool.
+
+This independent community project aims to make token usage, caching, and context consumption easier for MiMo Desktop users to understand. Thanks also to the developer community for sharing experiences and feedback.
+
+> **Disclaimer:** This project is independently developed and maintained by the community. It is not an official Xiaomi or MiMo product, and these acknowledgements do not imply sponsorship, endorsement, or affiliation.
+
 ## License
 
 MIT © Martin-soaring-dev
-
-> Unofficial third-party tool. Not affiliated with Xiaomi / MiMo.
