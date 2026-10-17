@@ -52,6 +52,7 @@
     "test:node": "node test/command-e2e.mjs",
     "test:runtime": "node test/runtime-check.mjs",
     "test:ui-dom": "node test/ui-dom.mjs",
+    "test:cdp": "node test/cdp-channel.test.mjs",
     "test:geometry": "node test/ui-geometry.mjs",
     "test:refresh": "node test/refresh-e2e.mjs",
     "test:scope": "node test/scope-switch.mjs",
