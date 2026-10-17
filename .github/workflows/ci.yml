@@ -49,6 +49,8 @@ jobs:
       # UI 几何回归必须真实跑起来：--require-chrome 把「没有浏览器」变成显式失败（exit 1），
       # 绝不允许缺依赖时静默 SKIP 却让 CI 显示绿色。windows-latest 镜像预装 Chrome/Edge，
       # cdp.mjs 会依次探测 CHROME_PATH 与 Chrome/Edge 的标准安装路径。
+      - name: CDP transport fault-path regressions (offline)
+        run: node test/cdp-channel.test.mjs
       - name: UI geometry tests (headless browser, required)
         run: node test/ui-geometry.mjs --require-chrome
       - name: Live refresh e2e (headless browser, required)

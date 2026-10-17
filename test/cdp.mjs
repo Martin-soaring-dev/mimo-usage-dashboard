@@ -11,6 +11,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { connectCdp } from "./cdp-channel.mjs";
 
 const CHROME_CANDIDATES = [
   process.env.CHROME_PATH,
@@ -59,12 +60,26 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
     "about:blank",
   ], { stdio: "ignore" });
 
+  let channel = null;
+  let childFailure = null;
+  child.on("exit", (code, signal) => {
+    childFailure = "Chrome exited (code=" + code + ", signal=" + signal + ")";
+    if (channel) channel.close();
+  });
+  child.on("error", (error) => {
+    childFailure = "Chrome spawn failed: " + error.message;
+    if (channel) channel.close();
+  });
+
   const getJSON = (p) => new Promise((resolve, reject) => {
-    http.get({ host: "127.0.0.1", port, path: p, timeout: 3000 }, (res) => {
+    const req = http.get({ host: "127.0.0.1", port, path: p }, (res) => {
       let s = "";
       res.on("data", (c) => (s += c));
+      res.on("error", reject);
       res.on("end", () => { try { resolve(JSON.parse(s)); } catch (e) { reject(e); } });
-    }).on("error", reject);
+    });
+    req.setTimeout(3000, () => req.destroy(new Error("CDP discovery HTTP timeout")));
+    req.on("error", reject);
   });
 
   const kill = () => { try { child.kill(); } catch { /* ignore */ } };
@@ -75,6 +90,7 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
 
   let page = null;
   for (let i = 0; i < 80 && !page; i++) {
+    if (childFailure) { cleanup(); throw new Error(childFailure); }
     await sleep(250);
     try {
       const list = await getJSON("/json/list");
@@ -84,34 +100,18 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
   if (!page) { cleanup(); throw new Error("chrome CDP 未就绪（拿不到 page target）"); }
 
   const ws = new WebSocket(page.webSocketDebuggerUrl);
-  let seq = 0;
-  const pending = new Map();
-  const listeners = [];
-
-  await new Promise((resolve, reject) => {
-    ws.addEventListener("open", resolve);
-    ws.addEventListener("error", () => reject(new Error("CDP WebSocket 连接失败")));
-  });
-  ws.addEventListener("message", (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.id && pending.has(msg.id)) {
-      const { resolve, reject } = pending.get(msg.id);
-      pending.delete(msg.id);
-      if (msg.error) reject(new Error(msg.method + ": " + JSON.stringify(msg.error)));
-      else resolve(msg.result);
-      return;
-    }
-    for (const fn of listeners) fn(msg);
-  });
-
-  const send = (method, params = {}) => new Promise((resolve, reject) => {
-    const id = ++seq;
-    pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ id, method, params }));
-  });
-
-  const on = (fn) => { listeners.push(fn); };
+  try {
+    channel = await connectCdp(ws);
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+  if (childFailure) {
+    channel.close();
+    cleanup();
+    throw new Error(childFailure);
+  }
+  const { send, on, rejectPending } = channel;
 
   // 收集页面自身的 console 错误与未捕获异常，用于「不引入 JS 控制台错误」的断言。
   const pageErrors = [];
@@ -124,11 +124,18 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
     }
   });
 
-  await send("Page.enable");
-  await send("Runtime.enable");
-  await send("Emulation.setDeviceMetricsOverride", {
-    width, height, deviceScaleFactor: 1, mobile: false,
-  });
+  try {
+    await send("Page.enable");
+    await send("Runtime.enable");
+    await send("Emulation.setDeviceMetricsOverride", {
+      width, height, deviceScaleFactor: 1, mobile: false,
+    });
+  } catch (error) {
+    rejectPending(new Error("CDP initialization aborted"));
+    channel.close();
+    cleanup();
+    throw error;
+  }
 
   const api = {
     send,
@@ -175,7 +182,7 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
     },
     async close() {
       try { await send("Page.close"); } catch { /* ignore */ }
-      try { ws.close(); } catch { /* ignore */ }
+      channel.close();
       cleanup();
     },
   };
