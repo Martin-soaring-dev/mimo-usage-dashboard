@@ -203,4 +203,4 @@ mimo-usage-dashboard uninstall
 - 不上传私有数据库、真实对话内容、API Key 或含实时服务令牌的浏览器截图。报告只在本机从 SQLite **只读**提取统计；实时模式监听 loopback，不能作为公网共享看板。
 - 本项目非小米 / MiMo 官方产品。
 
-**读完后进一步了解原理**：[README 中的架构解释](../README.md#设计原理与取舍) · [架构实证](architecture.md)。
+**读完后进一步了解原理**：[README 中的架构解释](../README.md#设计原理与实现) · [架构实证](architecture.md)。
