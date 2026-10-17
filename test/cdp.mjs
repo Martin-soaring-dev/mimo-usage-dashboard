@@ -60,6 +60,17 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
     "about:blank",
   ], { stdio: "ignore" });
 
+  let channel = null;
+  let childFailure = null;
+  child.on("exit", (code, signal) => {
+    childFailure = "Chrome exited (code=" + code + ", signal=" + signal + ")";
+    if (channel) channel.close();
+  });
+  child.on("error", (error) => {
+    childFailure = "Chrome spawn failed: " + error.message;
+    if (channel) channel.close();
+  });
+
   const getJSON = (p) => new Promise((resolve, reject) => {
     const req = http.get({ host: "127.0.0.1", port, path: p }, (res) => {
       let s = "";
@@ -79,6 +90,7 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
 
   let page = null;
   for (let i = 0; i < 80 && !page; i++) {
+    if (childFailure) { cleanup(); throw new Error(childFailure); }
     await sleep(250);
     try {
       const list = await getJSON("/json/list");
@@ -88,12 +100,16 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
   if (!page) { cleanup(); throw new Error("chrome CDP 未就绪（拿不到 page target）"); }
 
   const ws = new WebSocket(page.webSocketDebuggerUrl);
-  let channel;
   try {
     channel = await connectCdp(ws);
   } catch (error) {
     cleanup();
     throw error;
+  }
+  if (childFailure) {
+    channel.close();
+    cleanup();
+    throw new Error(childFailure);
   }
   const { send, on, rejectPending } = channel;
 
