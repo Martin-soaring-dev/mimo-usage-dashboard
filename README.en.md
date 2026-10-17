@@ -240,11 +240,9 @@ Manually: unregister the commands, then delete `~/.config/mimocode/usage-dashboa
 
 ## Acknowledgements
 
-Thanks to the teams behind **Xiaomi MiMo models** and **MiMo Desktop / MiMoCode**. The everyday experience of using MiMo Desktop inspired this project, and its local custom-command mechanism made it possible to integrate `/usage` and `/usage-open` with a local analytics tool.
+This project was developed with AI assistance from **Xiaomi MiMo models**, using **MiMo Desktop** throughout development and iteration, including implementation, debugging, and refinement.
 
-This independent community project aims to make token usage, caching, and context consumption easier for MiMo Desktop users to understand. Thanks also to the developer community for sharing experiences and feedback.
-
-> **Disclaimer:** This project is independently developed and maintained by the community. It is not an official Xiaomi or MiMo product, and these acknowledgements do not imply sponsorship, endorsement, or affiliation.
+MiMo Usage Dashboard is an independent open-source project for MiMo Desktop. Technical decisions, testing, validation, and maintenance remain the responsibility of the project maintainer.
 
 ## License
 
