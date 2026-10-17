@@ -11,9 +11,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-
-const CDP_CONNECT_TIMEOUT_MS = 8000;
-const CDP_COMMAND_TIMEOUT_MS = 8000;
+import { connectCdp } from "./cdp-channel.mjs";
 
 const CHROME_CANDIDATES = [
   process.env.CHROME_PATH,
@@ -90,80 +88,14 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
   if (!page) { cleanup(); throw new Error("chrome CDP 未就绪（拿不到 page target）"); }
 
   const ws = new WebSocket(page.webSocketDebuggerUrl);
-  let seq = 0;
-  const pending = new Map();
-  const listeners = [];
-
-  const rejectPending = (reason) => {
-    for (const [id, entry] of pending) {
-      clearTimeout(entry.timer);
-      pending.delete(id);
-      entry.reject(reason);
-    }
-  };
-  const socketFailure = (reason) => rejectPending(new Error(reason));
-  ws.addEventListener("close", () => socketFailure("CDP WebSocket closed"));
-  ws.addEventListener("error", () => socketFailure("CDP WebSocket error"));
-
+  let channel;
   try {
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("CDP WebSocket open timeout")), CDP_CONNECT_TIMEOUT_MS);
-      const finish = (error) => {
-        clearTimeout(timer);
-        ws.removeEventListener("open", onOpen);
-        ws.removeEventListener("error", onError);
-        ws.removeEventListener("close", onClose);
-        if (error) reject(error);
-        else resolve();
-      };
-      const onOpen = () => finish();
-      const onError = () => finish(new Error("CDP WebSocket connection failed"));
-      const onClose = () => finish(new Error("CDP WebSocket closed before open"));
-      ws.addEventListener("open", onOpen);
-      ws.addEventListener("error", onError);
-      ws.addEventListener("close", onClose);
-    });
+    channel = await connectCdp(ws);
   } catch (error) {
-    try { ws.close(); } catch { /* ignore */ }
     cleanup();
     throw error;
   }
-
-  ws.addEventListener("message", (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.id && pending.has(msg.id)) {
-      const entry = pending.get(msg.id);
-      clearTimeout(entry.timer);
-      pending.delete(msg.id);
-      if (msg.error) entry.reject(new Error(entry.method + ": " + JSON.stringify(msg.error)));
-      else entry.resolve(msg.result);
-      return;
-    }
-    for (const fn of listeners) fn(msg);
-  });
-
-  const send = (method, params = {}) => new Promise((resolve, reject) => {
-    if (ws.readyState !== WebSocket.OPEN) {
-      reject(new Error("CDP WebSocket not open: " + method));
-      return;
-    }
-    const id = ++seq;
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error("CDP command timeout: " + method));
-    }, CDP_COMMAND_TIMEOUT_MS);
-    pending.set(id, { resolve, reject, timer, method });
-    try {
-      ws.send(JSON.stringify({ id, method, params }));
-    } catch (error) {
-      clearTimeout(timer);
-      pending.delete(id);
-      reject(error);
-    }
-  });
-
-  const on = (fn) => { listeners.push(fn); };
+  const { send, on, rejectPending } = channel;
 
   // 收集页面自身的 console 错误与未捕获异常，用于「不引入 JS 控制台错误」的断言。
   const pageErrors = [];
@@ -184,7 +116,7 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
     });
   } catch (error) {
     rejectPending(new Error("CDP initialization aborted"));
-    try { ws.close(); } catch { /* ignore */ }
+    channel.close();
     cleanup();
     throw error;
   }
@@ -234,8 +166,7 @@ export async function openPage({ width = 1280, height = 2600 } = {}) {
     },
     async close() {
       try { await send("Page.close"); } catch { /* ignore */ }
-      rejectPending(new Error("CDP session closed"));
-      try { ws.close(); } catch { /* ignore */ }
+      channel.close();
       cleanup();
     },
   };
