@@ -8,7 +8,7 @@
 [![python](https://img.shields.io/badge/python-%E2%89%A53.10-brightgreen)](#%E5%AE%89%E8%A3%85)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-简体中文 · [English](./README.en.md)
+简体中文 · [English](./README.en.md) · **[🚀 快速上手](./docs/quick-start.md)** · [v0.2.1 Release](https://github.com/Martin-soaring-dev/mimo-usage-dashboard/releases/tag/v0.2.1)
 
 给 **MiMo Desktop**（内置 MiMoCode 引擎，OpenCode 分支）做**本机**用量统计：
 一个**本地命令行**，把用量渲染成 **HTML 看板**。
@@ -38,6 +38,111 @@
 
 - **Session 用量**：会话总数、累计 tokens、改动行 / 文件数、最近会话明细
 - **上下文占用**：当前会话上下文 tokens、构成（缓存读取 / 新输入 / 推理 / 输出）、模型、工作目录
+
+
+## 界面预览（合成数据示意）
+
+![MiMo Usage Dashboard 合成数据页面预览](./docs/preview.svg)
+
+> 这张图是仓库已有的 SVG 合成数据预览，**不是**真实用户数据或实机验收截图。v0.2.1 已在 Windows MiMo Desktop 26.1014.65535.94 完成原生安装、/usage、/usage-open 和卸载验收；原始验收截图未作为公开资产上传。
+
+**[🚀 从零安装、逐步使用、遇到问题如何处理：快速上手](./docs/quick-start.md)**
+
+| 你的目标 | 正确操作 | 预期结果 |
+|---|---|---|
+| 第一次装好 | `npm install -g mimo-usage-dashboard@0.2.1` → `mimo-usage-dashboard install` → 重启 MiMo，新建会话 | 命令面板出现 `/usage` 和 `/usage-open` |
+| 一次性查看用量 | `/usage` | 生成自包含 HTML 静态快照，返回路径 |
+| 需要按按钮刷新 | `/usage-open` | 启动按需本地只读服务、打开实时浏览器 |
+| 指定模型/时间窗、输出位置 | 本地终端运行 `python usage_cli.py token --days 7` 等 | 按参数生成独立报告；**斜杠命令不解析后缀参数** |
+| 确认安装/卸载 | `mimo-usage-dashboard doctor` / `uninstall` | 诊断配置、注销命令并安全删除项目拥有的文件 |
+
+## 设计原理与实现
+
+### 需求与边界
+
+MiMo Desktop 本身会将本机用量记录写入 SQLite 数据库。项目解决的是“如何从这些记录看清 token 构成、缓存命中、模型分布、会话活动和上下文占用”，**不是**推算套餐余量、读取模型服务端账单或上传你的聊天记录。统计始终在本机由 Python 程序确定计算，不让语言模型猜测数字；浏览器只负责展示已经聚合的数据。
+
+技术目标有三个：**可解释**（所有指标有口径）、**离线优先**（静态 HTML 可自行打开）、**低侵入**（只读 DB、按需实时服务、可逆的命令注册）。
+
+### 数据管线（逻辑图）
+
+```mermaid
+flowchart LR
+    A["MiMo Desktop\nmimocode.db"] -->|"SQLite read-only"| B["usage_cli.py"]
+    B --> C["统计聚合\nTokens / Model / Session / Context"]
+    C --> D["自包含 HTML\n默认静态快照"]
+    C --> E["仅 --open 时启动\n127.0.0.1 只读服务"]
+    E --> F["浏览器读取 JSON\n点击刷新数据"]
+```
+
+- **数据库读取**：以 SQLite `mode=ro` 读取 `session`、`message`、`part` 等表；数据库锁定或并发写入时使用临时只读快照路径，避免修改用户原数据库。
+- **计算层**：在本机按时间窗、模型和会话聚合 Token 与相关字段；上下文占用优先来自最新 step-finish 记录，不把累计 Tokens 误写成单轮上下文。
+- **展示层**：`usage_cli.py` 直接渲染内联样式、脚本和数据的独立 HTML；静态网页打开后无需 CDN/服务器连接。
+- **实时层**：`/usage-open` 启动或复用仅监听 `127.0.0.1` 的本地服务，随机令牌放在路径里，并校验 Host/Origin。API 返回只读聚合结果，不公开任意文件系统访问接口。关闭浏览器不一定马上关闭服务，服务可在空闲时间到期退出。
+
+### 斜杠命令为什么不用 AI 自己生成 HTML？
+
+仓库对目标客户端的 [MiMoCode 引擎机制实证](./docs/architecture.md) 表明：普通工具插件不能随意往 Desktop 右侧边栏挂自定义页面，AI 在聊天内流式生成大型 HTML 卡片则需要大量输出。项目采用 MiMo 的 `command.template` 固定本地 shell 替换机制：
+
+```mermaid
+sequenceDiagram
+  actor U as 用户
+  participant D as MiMo Desktop
+  participant T as command.template
+  participant P as Python CLI
+  participant H as HTML / Browser
+  U->>D: /usage
+  D->>T: 读取已注册命令
+  T->>P: 本地执行固定脚本
+  P->>P: 只读 DB、聚合统计
+  P->>H: 写 HTML
+  P-->>D: stdout：已生成文件路径
+  D-->>U: 显示简短结果
+```
+
+因此**是本地程序计算，而不是模型输出一套貌似正确的统计数值**。但需说准确：MiMo 引擎仍然可能把 shell 的 stdout 插回发给模型的消息，模型承担结果转述；这里的“零 AI 参与”特指**统计与 HTML 生成阶段**，不是声称消息完全不经过模型。
+
+`/usage`、`/usage-open` 的模板故意不拼接 `$ARGUMENTS`。所以在聊天里输入 `/usage token --days 7` **不会**安全地转化成筛选请求；高级参数应直接交给终端的 `usage_cli.py`。
+
+### 代码组成与职责
+
+| 文件 | 实际职责 |
+|---|---|
+| `bin/mimo-usage.js` | 零第三方依赖 npm 入口，寻找 Python ≥ 3.10、映射 install / upgrade / doctor / report / open / uninstall |
+| `install.ps1` | Windows 安装薄壳：校验解释器，把参数交给事务引擎 |
+| `installer.py` | 安装唯一事实来源：Preflight → Backup → Stage → Validate → Apply → Verify、回滚、升级和卸载 |
+| `register_command.py` | 对 JSONC 进行局部文本编辑，只注册/注销本项目拥有的 command，保留无关注释、BOM、CRLF 与字段 |
+| `usage_cli.py` | SQLite 只读查询、模型/会话聚合、HTML 渲染、仅本机的按需实时服务 |
+| `test/` | 合成库、安装器、CLI、命令模板、DOM/CDP 浏览器和回滚机制回归 |
+
+### 安装器为什么能安全升级和卸载？
+
+安装不是“复制两个 .py 文件后就结束”。`installer.py` 的六阶段事务先做**前置条件检查与归属识别**，再备份、阶段化准备、校验、应用并验证；失败时尽可能撤销本次操作。`install-manifest.json` 记录被项目管理的文件哈希和版本，因此卸载默认只移除“可证明属于本项目且未被用户修改”的文件，保留无关命令、项目外文件、历史报告、数据库和备份。若文件归属不明或 JSONC 无法安全解析，安装器拒绝静默覆盖；不要为了省事直接使用 `--force`。
+
+### 统计指标的准确含义
+
+| 卡片/指标 | 本项目口径 | 常见误解 |
+|---|---|---|
+| Tokens 总量 | 输入 Tokens + 输出 Tokens | 不等于最终付费金额 |
+| 输入 Tokens | 新输入 + 缓存读取 | 不等于“本次新发给模型的文本” |
+| 输出 Tokens | 文本输出 + 推理 Tokens | 不等于只计算屏幕可见文字 |
+| 缓存命中率 | cache.read / (tokens.input + cache.read) | 不是对全部 tokens 求比例 |
+| 模型份额 | 各模型 Tokens 占所选窗口的比例 | 不等于不同定价模型的费用比例 |
+| 上下文使用量 | 会话最新 step-finish 的 tokens.total，必要时回退最新 assistant 消息 | 不等于会话历史累计 token 总数 |
+| 上下文上限 | 配置中对应 providerID + modelID 的 limit.context，或本次显式值 | 不等于服务端永远固定的真实窗口 |
+
+热力图显示的是近一年的按日活跃度，**不随** `--days 7` 改成只有七天。模型条的长度表示该模型对窗口内 Token 总量的份额，浅色段才是缓存读取占比，颜色不能混用。
+
+### 会话定格：为什么最近活跃会话不一定是当前聊天？
+
+当使用 `/usage-open` 打开新浏览器标签页时，应用会将“**第一次加载时最近活跃的会话**”定格到这个标签页，之后刷新不悄悄换到新会话。这修复了旧行为中浏览器标签页随最近会话漂移的风险，但它**不是**“命令在哪个聊天发送就必然绑定哪个聊天”——当前斜杠命令机制拿不到该会话身份。页面可切换“会话用量 / 全局用量”；需要强制指定某个会话，请在 CLI 使用 `--session`。详见 [快速上手 `4](./docs/quick-start.md#4-实时模式浏览器中刷新)。
+
+### 验证边界、安全与风险
+
+- 已实测：Windows 11、MiMo Desktop 26.1014.65535.94；真实客户端原生加载、静态报告、实时刷新、卸载后命令消失均完成。其他平台没有同等级客户端验证。
+- 静态报告默认不监听端口；实时服务限制在 loopback，报告内容仍属于个人敏感数据，勿在公开截图中暴露随机 URL token 或私人会话路径。
+- 已知 P2：[#35 启动服务偶发失败](https://github.com/Martin-soaring-dev/mimo-usage-dashboard/issues/35)（可能退化为静态报告但终端提示不足）、[#39 特殊隐藏目录路径的 Markdown 转义](https://github.com/Martin-soaring-dev/mimo-usage-dashboard/issues/39)（`\.` 反斜杠可能丢失，导致链接无效）。两者在 v0.2.1 **未宣称已修复**。
+- 可靠性证据、npm/GitHub 分发哈希与发布边界见 [v0.2.1 发布报告](./docs/releases/v0.2.1-release-report.md)。实操故障表请看 [快速上手](./docs/quick-start.md#7-我这样做会有什么响应故障速查)。
 
 ## 为什么是「本地命令 + 静态网页」
 

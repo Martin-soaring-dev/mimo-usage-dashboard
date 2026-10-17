@@ -8,7 +8,7 @@
 [![python](https://img.shields.io/badge/python-%E2%89%A53.10-brightgreen)](#install)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-[简体中文](./README.md) · English
+[简体中文](./README.md) · English · **[Quick start (中文)](./docs/quick-start.md)**
 
 Local usage stats for **MiMo Desktop** (built on the MiMoCode engine, an OpenCode fork):
 a single **local command** that renders usage into an **HTML dashboard**.
