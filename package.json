@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "mimo-usage-dashboard",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MiMo Desktop local usage dashboard — a zero-AI Python CLI that renders HTML dashboards (token usage, cache hit rate, model share, session stats, context occupancy). Static snapshot by default; --open starts a loopback-only read-only refresh server.",
   "type": "module",
   "license": "MIT",
